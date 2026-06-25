@@ -147,8 +147,16 @@ app.post('/publish', async (req, res) => {
     await publishBtn.click();
     console.log('投稿ボタン1段階目クリック完了');
 
-    // 公開設定ページへの遷移を待つ
-    await page.waitForTimeout(4000);
+    // 公開設定ページ（/publish/）へのURL変化を待つ
+    try {
+      await page.waitForURL(/editor\.note\.com\/notes\/n[a-zA-Z0-9]+\/publish/, { timeout: 15000 });
+      console.log('publishページURLに変化確認');
+    } catch (e) {
+      console.log('waitForURL timeout, 現在URL:', page.url());
+    }
+
+    // ページが完全にレンダリングされるまで待つ
+    await page.waitForTimeout(3000);
     const publishPageUrl = page.url();
     console.log('公開設定ページURL:', publishPageUrl);
 
@@ -157,7 +165,7 @@ app.post('/publish', async (req, res) => {
     const noteId = noteIdMatch ? noteIdMatch[1] : null;
     console.log('noteId:', noteId);
 
-    // 2段階目：「投稿する」確認ボタン
+    // 2段階目：「投稿する」確認ボタン（タイムアウト5秒で探す）
     const confirmSelectors = [
       'button:has-text("投稿する")',
       'button:has-text("公開する")',
@@ -170,7 +178,7 @@ app.post('/publish', async (req, res) => {
     let confirmed = false;
     for (const sel of confirmSelectors) {
       const btn = page.locator(sel).last();
-      const visible = await btn.isVisible({ timeout: 1000 }).catch(() => false);
+      const visible = await btn.isVisible({ timeout: 5000 }).catch(() => false);
       if (visible) {
         await btn.click();
         console.log('確認ボタンクリック:', sel);
@@ -179,9 +187,24 @@ app.post('/publish', async (req, res) => {
       }
     }
 
+    // 確認ボタンが見つからない場合、現在のボタン一覧を返す
     if (!confirmed) {
+      const allButtons = await page.locator('button').all();
+      const buttonInfos = [];
+      for (const btn of allButtons) {
+        const text = (await btn.innerText().catch(() => '')).trim();
+        const ariaLabel = (await btn.getAttribute('aria-label').catch(() => '')) || '';
+        const visible = await btn.isVisible().catch(() => false);
+        buttonInfos.push({ text, ariaLabel, visible });
+      }
       await browser.close();
-      return res.json({ success: false, error: '確認ボタンが見つかりません', noteId });
+      return res.json({
+        success: false,
+        error: '確認ボタンが見つかりません',
+        noteId,
+        publishPageUrl,
+        buttons: buttonInfos
+      });
     }
 
     // 投稿APIの完了を待つ
@@ -195,7 +218,7 @@ app.post('/publish', async (req, res) => {
       return res.json({ success: true, url: afterUrl.split('?')[0] });
     }
 
-    // note.com APIで直接note情報を取得（context.requestを使ってcookieを引き継ぐ）
+    // note.com APIでnote情報を取得
     if (noteId) {
       try {
         const apiResp = await context.request.get(`https://note.com/api/v2/notes/${noteId}`);
@@ -215,7 +238,6 @@ app.post('/publish', async (req, res) => {
           return res.json({ success: true, url: noteUrl, status: noteStatus });
         }
 
-        // API返ったがkeyかurlnameが空 → デバッグ情報を返す
         await browser.close();
         return res.json({
           success: false,
