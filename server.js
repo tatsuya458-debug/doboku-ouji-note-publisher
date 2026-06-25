@@ -22,37 +22,40 @@ app.post('/publish', async (req, res) => {
       viewport: { width: 1280, height: 800 }
     });
 
-    const cookies = cookie.split('; ').map(c => {
+    // .note.com と editor.note.com 両方にCookieを設定
+    const parsedCookies = cookie.split('; ').map(c => {
       const eqIdx = c.indexOf('=');
       return {
         name: c.substring(0, eqIdx).trim(),
         value: c.substring(eqIdx + 1).trim(),
-        domain: '.note.com',
         path: '/'
       };
     }).filter(c => c.name && c.value);
-    await context.addCookies(cookies);
+
+    await context.addCookies([
+      ...parsedCookies.map(c => ({ ...c, domain: '.note.com' })),
+      ...parsedCookies.map(c => ({ ...c, domain: 'editor.note.com' })),
+    ]);
 
     const page = await context.newPage();
-    await page.goto('https://note.com/notes/new', { waitUntil: 'networkidle', timeout: 30000 });
+    await page.goto('https://editor.note.com/new', { waitUntil: 'networkidle', timeout: 30000 });
 
     const currentUrl = page.url();
     const pageTitle = await page.title();
     console.log('URL:', currentUrl, 'PageTitle:', pageTitle);
 
-    if (currentUrl.includes('/login') || currentUrl.includes('/signin')) {
+    if (currentUrl.includes('/login') || currentUrl.includes('/signin') || currentUrl.includes('/sign_in')) {
       await browser.close();
-      return res.json({ success: false, error: 'Cookie切れ。GASでsetNoteCookie()を再実行してください' });
+      return res.json({ success: false, error: 'Cookie切れ URL=' + currentUrl });
     }
 
-    // タイトル欄を複数セレクタで探す
+    // エディタ読み込み待ち
+    await page.waitForTimeout(3000);
+
+    // タイトル欄を探す（editor.note.comはcontenteditable使用）
     const titleSelectors = [
-      'input[placeholder*="タイトル"]',
-      'textarea[placeholder*="タイトル"]',
       '[data-placeholder*="タイトル"]',
-      'input[name="name"]',
-      'input[class*="title" i]',
-      'textarea[class*="title" i]',
+      '[placeholder*="タイトル"]',
       'input[type="text"]',
       'textarea',
     ];
@@ -60,11 +63,22 @@ app.post('/publish', async (req, res) => {
     let titleEl = null;
     for (const sel of titleSelectors) {
       const el = page.locator(sel).first();
-      const visible = await el.isVisible({ timeout: 3000 }).catch(() => false);
+      const visible = await el.isVisible({ timeout: 2000 }).catch(() => false);
       if (visible) {
         titleEl = el;
         console.log('タイトルセレクタ:', sel);
         break;
+      }
+    }
+
+    // フォールバック: 最初のcontenteditable div
+    if (!titleEl) {
+      const contentEditables = page.locator('div[contenteditable="true"]');
+      const count = await contentEditables.count().catch(() => 0);
+      console.log('contenteditable要素数:', count);
+      if (count > 0) {
+        titleEl = contentEditables.first();
+        console.log('contenteditable[0]をタイトルとして使用');
       }
     }
 
@@ -74,16 +88,33 @@ app.post('/publish', async (req, res) => {
     }
 
     await titleEl.click();
-    await titleEl.fill(title);
-    await page.waitForTimeout(1000);
+    await page.keyboard.type(title);
+    await page.waitForTimeout(500);
+    await page.keyboard.press('Tab');
+    await page.waitForTimeout(500);
 
-    // 本文欄
-    const bodyEl = page.locator('.ProseMirror, [contenteditable="true"]').first();
-    const bodyVisible = await bodyEl.isVisible({ timeout: 5000 }).catch(() => false);
-    if (!bodyVisible) {
+    // 本文欄（2番目のcontenteditable または ProseMirror）
+    let bodyEl = null;
+    const contentEditables = page.locator('div[contenteditable="true"]');
+    const ceCount = await contentEditables.count().catch(() => 0);
+    console.log('本文探索 contenteditable数:', ceCount);
+
+    if (ceCount >= 2) {
+      bodyEl = contentEditables.nth(1);
+    } else if (ceCount === 1) {
+      bodyEl = contentEditables.first();
+    } else {
+      const proseMirror = page.locator('.ProseMirror').first();
+      if (await proseMirror.isVisible({ timeout: 3000 }).catch(() => false)) {
+        bodyEl = proseMirror;
+      }
+    }
+
+    if (!bodyEl) {
       await browser.close();
       return res.json({ success: false, error: '本文欄が見つかりません' });
     }
+
     await bodyEl.click();
     await page.keyboard.type(body, { delay: 2 });
     await page.waitForTimeout(1000);
@@ -98,12 +129,14 @@ app.post('/publish', async (req, res) => {
     await publishBtn.click();
     await page.waitForTimeout(2000);
 
+    // 確認ダイアログ
     const confirmBtn = page.locator('button:has-text("公開する"), button:has-text("投稿する")').last();
     if (await confirmBtn.isVisible({ timeout: 3000 }).catch(() => false)) {
       await confirmBtn.click();
     }
 
-    await page.waitForURL('**/n/**', { timeout: 20000 });
+    // 公開後URLを待つ（note.com または editor.note.com の /n/ パス）
+    await page.waitForURL(/note\.com.*\/n\//, { timeout: 20000 });
     const noteUrl = page.url().split('?')[0];
 
     await browser.close();
