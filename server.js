@@ -116,7 +116,7 @@ app.post('/publish', async (req, res) => {
     await page.keyboard.type(body, { delay: 2 });
     await page.waitForTimeout(1000);
 
-    // 投稿ボタン（1段階目）
+    // 投稿ボタン（1段階目：公開設定ページへ）
     const publishSelectors = [
       'button:has-text("投稿する")',
       'button:has-text("公開する")',
@@ -143,36 +143,24 @@ app.post('/publish', async (req, res) => {
     }
 
     if (!publishBtn) {
-      const allButtons = await page.locator('button').all();
-      const buttonInfos = [];
-      for (const btn of allButtons) {
-        const text = (await btn.innerText().catch(() => '')).trim();
-        const ariaLabel = (await btn.getAttribute('aria-label').catch(() => '')) || '';
-        const visible = await btn.isVisible().catch(() => false);
-        buttonInfos.push({ text, ariaLabel, visible });
-      }
       await browser.close();
-      return res.json({ success: false, error: '投稿ボタンが見つかりません', buttons: buttonInfos });
+      return res.json({ success: false, error: '投稿ボタン(1段階目)が見つかりません' });
     }
 
     await publishBtn.click();
     console.log('投稿ボタン1段階目クリック完了');
 
-    // モーダル/ダイアログが開くまで待つ（最大5秒）
+    // 公開設定ページ（/publish/）への遷移を待つ
     await page.waitForTimeout(4000);
+    const publishPageUrl = page.url();
+    console.log('公開設定ページURL:', publishPageUrl);
 
-    // モーダル内ボタンをログ
-    const afterClickButtons = await page.locator('button').all();
-    const afterButtonInfos = [];
-    for (const btn of afterClickButtons) {
-      const text = (await btn.innerText().catch(() => '')).trim();
-      const ariaLabel = (await btn.getAttribute('aria-label').catch(() => '')) || '';
-      const visible = await btn.isVisible().catch(() => false);
-      afterButtonInfos.push({ text, ariaLabel, visible });
-    }
-    console.log('クリック後ボタン一覧:', JSON.stringify(afterButtonInfos));
+    // URLからnote IDを抽出（例: /notes/n3b157fd7e1c1/publish/）
+    const noteIdMatch = publishPageUrl.match(/\/notes\/(n[a-zA-Z0-9]+)/);
+    const noteId = noteIdMatch ? noteIdMatch[1] : null;
+    console.log('noteId:', noteId);
 
-    // 確認ボタン（2段階目）- モーダル内の最終投稿ボタン
+    // 2段階目：「投稿する」確認ボタン
     const confirmSelectors = [
       'button:has-text("投稿する")',
       'button:has-text("公開する")',
@@ -184,7 +172,6 @@ app.post('/publish', async (req, res) => {
 
     let confirmed = false;
     for (const sel of confirmSelectors) {
-      // lastを使って最後のボタン（モーダル内のもの）を優先
       const btn = page.locator(sel).last();
       const visible = await btn.isVisible({ timeout: 1000 }).catch(() => false);
       if (visible) {
@@ -196,34 +183,50 @@ app.post('/publish', async (req, res) => {
     }
 
     if (!confirmed) {
-      console.log('確認ボタンが見つからなかったため、URLをそのまま確認します');
+      await browser.close();
+      return res.json({ success: false, error: '確認ボタンが見つかりません', noteId });
     }
 
-    // URL変化をポーリングで確認（waitForURLより柔軟）
-    let noteUrl = null;
-    for (let i = 0; i < 30; i++) {
-      await page.waitForTimeout(1000);
-      const u = page.url();
-      console.log('URL確認:', u);
-      if (u.includes('/n/') && u.includes('note.com')) {
-        noteUrl = u.split('?')[0];
-        break;
+    // 投稿APIの完了を待つ
+    await page.waitForTimeout(5000);
+
+    // URL変化チェック（/n/ パターン）
+    const afterUrl = page.url();
+    console.log('投稿後URL:', afterUrl);
+    if (afterUrl.includes('/n/') && afterUrl.includes('note.com')) {
+      await browser.close();
+      return res.json({ success: true, url: afterUrl.split('?')[0] });
+    }
+
+    // note.com APIでnote IDから公開URLを取得
+    if (noteId) {
+      await page.goto(`https://note.com/api/v2/notes/${noteId}`, { waitUntil: 'domcontentloaded', timeout: 15000 });
+      const bodyText = await page.locator('body').innerText().catch(() => '{}');
+      console.log('API response (first 200):', bodyText.substring(0, 200));
+      try {
+        const apiData = JSON.parse(bodyText);
+        const key = apiData.data?.key || '';
+        const urlname = apiData.data?.user?.urlname || '';
+        const status = apiData.data?.status || '';
+        console.log('note key:', key, 'urlname:', urlname, 'status:', status);
+        if (key && urlname) {
+          const noteUrl = `https://note.com/${urlname}/n/${key}`;
+          await browser.close();
+          return res.json({ success: true, url: noteUrl, status });
+        }
+      } catch (e) {
+        console.log('APIパースエラー:', e.message);
       }
     }
 
-    if (!noteUrl) {
-      const finalUrl = page.url();
-      await browser.close();
-      return res.json({
-        success: false,
-        error: 'URL変化タイムアウト finalUrl=' + finalUrl,
-        confirmed,
-        afterButtons: afterButtonInfos
-      });
-    }
-
     await browser.close();
-    return res.json({ success: true, url: noteUrl });
+    return res.json({
+      success: false,
+      error: 'URLを特定できませんでした',
+      noteId,
+      afterUrl,
+      publishPageUrl
+    });
 
   } catch (e) {
     if (browser) await browser.close().catch(() => {});
