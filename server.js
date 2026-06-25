@@ -116,17 +116,19 @@ app.post('/publish', async (req, res) => {
     await page.keyboard.type(body, { delay: 2 });
     await page.waitForTimeout(1000);
 
-    // ページ上の全ボタンをログ（デバッグ用）
+    // 全ボタン情報をデバッグ出力（テキスト・aria-label・class）
     const allButtons = await page.locator('button').all();
-    const buttonTexts = [];
+    const buttonInfos = [];
     for (const btn of allButtons) {
       const text = (await btn.innerText().catch(() => '')).trim();
+      const ariaLabel = (await btn.getAttribute('aria-label').catch(() => '')) || '';
+      const cls = (await btn.getAttribute('class').catch(() => '')) || '';
       const visible = await btn.isVisible().catch(() => false);
-      if (text) buttonTexts.push({ text, visible });
+      buttonInfos.push({ text, ariaLabel, cls: cls.substring(0, 60), visible });
     }
-    console.log('ボタン一覧:', JSON.stringify(buttonTexts));
+    console.log('ボタン一覧v2:', JSON.stringify(buttonInfos));
 
-    // 投稿ボタン（複数パターンを試す）
+    // 投稿ボタン（テキスト・aria-labelの両方で検索）
     const publishSelectors = [
       'button:has-text("投稿する")',
       'button:has-text("公開する")',
@@ -134,15 +136,17 @@ app.post('/publish', async (req, res) => {
       'button:has-text("保存して公開")',
       'button:has-text("投稿")',
       'button:has-text("公開")',
+      'button[aria-label*="投稿"]',
+      'button[aria-label*="公開"]',
+      'button[aria-label*="publish"]',
       '[data-testid*="publish"]',
-      '[aria-label*="投稿"]',
-      '[aria-label*="公開"]',
+      '[data-testid*="post"]',
     ];
 
     let publishBtn = null;
     for (const sel of publishSelectors) {
       const btn = page.locator(sel).first();
-      const visible = await btn.isVisible({ timeout: 2000 }).catch(() => false);
+      const visible = await btn.isVisible({ timeout: 1000 }).catch(() => false);
       if (visible) {
         publishBtn = btn;
         console.log('投稿ボタンセレクタ:', sel);
@@ -154,8 +158,8 @@ app.post('/publish', async (req, res) => {
       await browser.close();
       return res.json({
         success: false,
-        error: '投稿ボタンが見つかりません',
-        buttons: buttonTexts
+        error: '投稿ボタンが見つかりません v2',
+        buttons: buttonInfos
       });
     }
 
