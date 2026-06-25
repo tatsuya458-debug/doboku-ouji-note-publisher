@@ -126,9 +126,6 @@ app.post('/publish', async (req, res) => {
       'button:has-text("公開")',
       'button[aria-label*="投稿"]',
       'button[aria-label*="公開"]',
-      'button[aria-label*="publish"]',
-      '[data-testid*="publish"]',
-      '[data-testid*="post"]',
     ];
 
     let publishBtn = null;
@@ -150,12 +147,12 @@ app.post('/publish', async (req, res) => {
     await publishBtn.click();
     console.log('投稿ボタン1段階目クリック完了');
 
-    // 公開設定ページ（/publish/）への遷移を待つ
+    // 公開設定ページへの遷移を待つ
     await page.waitForTimeout(4000);
     const publishPageUrl = page.url();
     console.log('公開設定ページURL:', publishPageUrl);
 
-    // URLからnote IDを抽出（例: /notes/n3b157fd7e1c1/publish/）
+    // URLからnote IDを抽出
     const noteIdMatch = publishPageUrl.match(/\/notes\/(n[a-zA-Z0-9]+)/);
     const noteId = noteIdMatch ? noteIdMatch[1] : null;
     console.log('noteId:', noteId);
@@ -188,9 +185,9 @@ app.post('/publish', async (req, res) => {
     }
 
     // 投稿APIの完了を待つ
-    await page.waitForTimeout(5000);
+    await page.waitForTimeout(8000);
 
-    // URL変化チェック（/n/ パターン）
+    // URL変化チェック
     const afterUrl = page.url();
     console.log('投稿後URL:', afterUrl);
     if (afterUrl.includes('/n/') && afterUrl.includes('note.com')) {
@@ -198,35 +195,44 @@ app.post('/publish', async (req, res) => {
       return res.json({ success: true, url: afterUrl.split('?')[0] });
     }
 
-    // note.com APIでnote IDから公開URLを取得
+    // note.com APIで直接note情報を取得（context.requestを使ってcookieを引き継ぐ）
     if (noteId) {
-      await page.goto(`https://note.com/api/v2/notes/${noteId}`, { waitUntil: 'domcontentloaded', timeout: 15000 });
-      const bodyText = await page.locator('body').innerText().catch(() => '{}');
-      console.log('API response (first 200):', bodyText.substring(0, 200));
       try {
-        const apiData = JSON.parse(bodyText);
+        const apiResp = await context.request.get(`https://note.com/api/v2/notes/${noteId}`);
+        const apiStatus = apiResp.status();
+        const apiText = await apiResp.text();
+        console.log('API status:', apiStatus, 'response:', apiText.substring(0, 300));
+
+        const apiData = JSON.parse(apiText);
         const key = apiData.data?.key || '';
         const urlname = apiData.data?.user?.urlname || '';
-        const status = apiData.data?.status || '';
-        console.log('note key:', key, 'urlname:', urlname, 'status:', status);
+        const noteStatus = apiData.data?.status || '';
+        console.log('key:', key, 'urlname:', urlname, 'status:', noteStatus);
+
         if (key && urlname) {
           const noteUrl = `https://note.com/${urlname}/n/${key}`;
           await browser.close();
-          return res.json({ success: true, url: noteUrl, status });
+          return res.json({ success: true, url: noteUrl, status: noteStatus });
         }
+
+        // API返ったがkeyかurlnameが空 → デバッグ情報を返す
+        await browser.close();
+        return res.json({
+          success: false,
+          error: 'APIレスポンス不完全',
+          apiStatus,
+          apiSample: apiText.substring(0, 500),
+          noteId,
+          noteStatus
+        });
       } catch (e) {
-        console.log('APIパースエラー:', e.message);
+        await browser.close();
+        return res.json({ success: false, error: 'APIエラー: ' + e.message, noteId });
       }
     }
 
     await browser.close();
-    return res.json({
-      success: false,
-      error: 'URLを特定できませんでした',
-      noteId,
-      afterUrl,
-      publishPageUrl
-    });
+    return res.json({ success: false, error: 'noteId取得失敗', publishPageUrl });
 
   } catch (e) {
     if (browser) await browser.close().catch(() => {});
