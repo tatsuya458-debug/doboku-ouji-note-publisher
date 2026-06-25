@@ -116,19 +116,7 @@ app.post('/publish', async (req, res) => {
     await page.keyboard.type(body, { delay: 2 });
     await page.waitForTimeout(1000);
 
-    // 全ボタン情報をデバッグ出力（テキスト・aria-label・class）
-    const allButtons = await page.locator('button').all();
-    const buttonInfos = [];
-    for (const btn of allButtons) {
-      const text = (await btn.innerText().catch(() => '')).trim();
-      const ariaLabel = (await btn.getAttribute('aria-label').catch(() => '')) || '';
-      const cls = (await btn.getAttribute('class').catch(() => '')) || '';
-      const visible = await btn.isVisible().catch(() => false);
-      buttonInfos.push({ text, ariaLabel, cls: cls.substring(0, 60), visible });
-    }
-    console.log('ボタン一覧v2:', JSON.stringify(buttonInfos));
-
-    // 投稿ボタン（テキスト・aria-labelの両方で検索）
+    // 投稿ボタン（1段階目）
     const publishSelectors = [
       'button:has-text("投稿する")',
       'button:has-text("公開する")',
@@ -149,35 +137,90 @@ app.post('/publish', async (req, res) => {
       const visible = await btn.isVisible({ timeout: 1000 }).catch(() => false);
       if (visible) {
         publishBtn = btn;
-        console.log('投稿ボタンセレクタ:', sel);
+        console.log('投稿ボタン1段階目セレクタ:', sel);
         break;
       }
     }
 
     if (!publishBtn) {
+      const allButtons = await page.locator('button').all();
+      const buttonInfos = [];
+      for (const btn of allButtons) {
+        const text = (await btn.innerText().catch(() => '')).trim();
+        const ariaLabel = (await btn.getAttribute('aria-label').catch(() => '')) || '';
+        const visible = await btn.isVisible().catch(() => false);
+        buttonInfos.push({ text, ariaLabel, visible });
+      }
       await browser.close();
-      return res.json({
-        success: false,
-        error: '投稿ボタンが見つかりません v2',
-        buttons: buttonInfos
-      });
+      return res.json({ success: false, error: '投稿ボタンが見つかりません', buttons: buttonInfos });
     }
 
     await publishBtn.click();
-    await page.waitForTimeout(2000);
+    console.log('投稿ボタン1段階目クリック完了');
 
-    // 確認ダイアログ
-    for (const sel of ['button:has-text("公開する")', 'button:has-text("投稿する")', 'button:has-text("公開")', 'button:has-text("投稿")']) {
+    // モーダル/ダイアログが開くまで待つ（最大5秒）
+    await page.waitForTimeout(4000);
+
+    // モーダル内ボタンをログ
+    const afterClickButtons = await page.locator('button').all();
+    const afterButtonInfos = [];
+    for (const btn of afterClickButtons) {
+      const text = (await btn.innerText().catch(() => '')).trim();
+      const ariaLabel = (await btn.getAttribute('aria-label').catch(() => '')) || '';
+      const visible = await btn.isVisible().catch(() => false);
+      afterButtonInfos.push({ text, ariaLabel, visible });
+    }
+    console.log('クリック後ボタン一覧:', JSON.stringify(afterButtonInfos));
+
+    // 確認ボタン（2段階目）- モーダル内の最終投稿ボタン
+    const confirmSelectors = [
+      'button:has-text("投稿する")',
+      'button:has-text("公開する")',
+      'button:has-text("投稿")',
+      'button:has-text("公開")',
+      'button[aria-label*="投稿"]',
+      'button[aria-label*="公開"]',
+    ];
+
+    let confirmed = false;
+    for (const sel of confirmSelectors) {
+      // lastを使って最後のボタン（モーダル内のもの）を優先
       const btn = page.locator(sel).last();
-      if (await btn.isVisible({ timeout: 2000 }).catch(() => false)) {
+      const visible = await btn.isVisible({ timeout: 1000 }).catch(() => false);
+      if (visible) {
         await btn.click();
+        console.log('確認ボタンクリック:', sel);
+        confirmed = true;
         break;
       }
     }
 
-    // 公開後URL待ち
-    await page.waitForURL(/note\.com.*\/n\//, { timeout: 20000 });
-    const noteUrl = page.url().split('?')[0];
+    if (!confirmed) {
+      console.log('確認ボタンが見つからなかったため、URLをそのまま確認します');
+    }
+
+    // URL変化をポーリングで確認（waitForURLより柔軟）
+    let noteUrl = null;
+    for (let i = 0; i < 30; i++) {
+      await page.waitForTimeout(1000);
+      const u = page.url();
+      console.log('URL確認:', u);
+      if (u.includes('/n/') && u.includes('note.com')) {
+        noteUrl = u.split('?')[0];
+        break;
+      }
+    }
+
+    if (!noteUrl) {
+      const finalUrl = page.url();
+      await browser.close();
+      return res.json({
+        success: false,
+        error: 'URL変化タイムアウト finalUrl=' + finalUrl,
+        confirmed,
+        afterButtons: afterButtonInfos
+      });
+    }
 
     await browser.close();
     return res.json({ success: true, url: noteUrl });
