@@ -22,7 +22,6 @@ app.post('/publish', async (req, res) => {
       viewport: { width: 1280, height: 800 }
     });
 
-    // .note.com と editor.note.com 両方にCookieを設定
     const parsedCookies = cookie.split('; ').map(c => {
       const eqIdx = c.indexOf('=');
       return {
@@ -49,10 +48,9 @@ app.post('/publish', async (req, res) => {
       return res.json({ success: false, error: 'Cookie切れ URL=' + currentUrl });
     }
 
-    // エディタ読み込み待ち
     await page.waitForTimeout(3000);
 
-    // タイトル欄を探す（editor.note.comはcontenteditable使用）
+    // タイトル欄
     const titleSelectors = [
       '[data-placeholder*="タイトル"]',
       '[placeholder*="タイトル"]',
@@ -71,7 +69,6 @@ app.post('/publish', async (req, res) => {
       }
     }
 
-    // フォールバック: 最初のcontenteditable div
     if (!titleEl) {
       const contentEditables = page.locator('div[contenteditable="true"]');
       const count = await contentEditables.count().catch(() => 0);
@@ -93,7 +90,7 @@ app.post('/publish', async (req, res) => {
     await page.keyboard.press('Tab');
     await page.waitForTimeout(500);
 
-    // 本文欄（2番目のcontenteditable または ProseMirror）
+    // 本文欄
     let bodyEl = null;
     const contentEditables = page.locator('div[contenteditable="true"]');
     const ceCount = await contentEditables.count().catch(() => 0);
@@ -119,23 +116,62 @@ app.post('/publish', async (req, res) => {
     await page.keyboard.type(body, { delay: 2 });
     await page.waitForTimeout(1000);
 
-    // 投稿ボタン
-    const publishBtn = page.locator('button:has-text("投稿する"), button:has-text("公開する")').first();
-    const btnVisible = await publishBtn.isVisible({ timeout: 10000 }).catch(() => false);
-    if (!btnVisible) {
-      await browser.close();
-      return res.json({ success: false, error: '投稿ボタンが見つかりません' });
+    // ページ上の全ボタンをログ（デバッグ用）
+    const allButtons = await page.locator('button').all();
+    const buttonTexts = [];
+    for (const btn of allButtons) {
+      const text = (await btn.innerText().catch(() => '')).trim();
+      const visible = await btn.isVisible().catch(() => false);
+      if (text) buttonTexts.push({ text, visible });
     }
+    console.log('ボタン一覧:', JSON.stringify(buttonTexts));
+
+    // 投稿ボタン（複数パターンを試す）
+    const publishSelectors = [
+      'button:has-text("投稿する")',
+      'button:has-text("公開する")',
+      'button:has-text("公開設定")',
+      'button:has-text("保存して公開")',
+      'button:has-text("投稿")',
+      'button:has-text("公開")',
+      '[data-testid*="publish"]',
+      '[aria-label*="投稿"]',
+      '[aria-label*="公開"]',
+    ];
+
+    let publishBtn = null;
+    for (const sel of publishSelectors) {
+      const btn = page.locator(sel).first();
+      const visible = await btn.isVisible({ timeout: 2000 }).catch(() => false);
+      if (visible) {
+        publishBtn = btn;
+        console.log('投稿ボタンセレクタ:', sel);
+        break;
+      }
+    }
+
+    if (!publishBtn) {
+      await browser.close();
+      return res.json({
+        success: false,
+        error: '投稿ボタンが見つかりません',
+        buttons: buttonTexts
+      });
+    }
+
     await publishBtn.click();
     await page.waitForTimeout(2000);
 
     // 確認ダイアログ
-    const confirmBtn = page.locator('button:has-text("公開する"), button:has-text("投稿する")').last();
-    if (await confirmBtn.isVisible({ timeout: 3000 }).catch(() => false)) {
-      await confirmBtn.click();
+    for (const sel of ['button:has-text("公開する")', 'button:has-text("投稿する")', 'button:has-text("公開")', 'button:has-text("投稿")']) {
+      const btn = page.locator(sel).last();
+      if (await btn.isVisible({ timeout: 2000 }).catch(() => false)) {
+        await btn.click();
+        break;
+      }
     }
 
-    // 公開後URLを待つ（note.com または editor.note.com の /n/ パス）
+    // 公開後URL待ち
     await page.waitForURL(/note\.com.*\/n\//, { timeout: 20000 });
     const noteUrl = page.url().split('?')[0];
 
