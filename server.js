@@ -164,7 +164,7 @@ app.post('/publish', async (req, res) => {
     const noteId = noteIdMatch ? noteIdMatch[1] : null;
     console.log('noteId:', noteId);
 
-    // 2段階目：「投稿する」確認ボタン（タイムアウト5秒で探す）
+    // 2段階目：「投稿する」確認ボタン
     const confirmSelectors = [
       'button:has-text("投稿する")',
       'button:has-text("公開する")',
@@ -196,66 +196,70 @@ app.post('/publish', async (req, res) => {
         buttonInfos.push({ text, ariaLabel, visible });
       }
       await browser.close();
-      return res.json({
-        success: false,
-        error: '確認ボタンが見つかりません',
-        noteId,
-        publishPageUrl,
-        buttons: buttonInfos
-      });
+      return res.json({ success: false, error: '確認ボタンが見つかりません', noteId, publishPageUrl, buttons: buttonInfos });
     }
 
-    // 投稿APIの完了を待つ
-    await page.waitForTimeout(5000);
+    // 投稿完了を待つ（URL変化 or タイムアウト）
+    let noteUrl = null;
+    try {
+      await page.waitForURL(/note\.com.*\/n\//, { timeout: 10000 });
+      noteUrl = page.url().split('?')[0];
+    } catch (e) {
+      console.log('URL変化なし、note IDから構築します');
+    }
 
-    // URL変化チェック
-    const afterUrl = page.url();
-    console.log('投稿後URL:', afterUrl);
-    if (afterUrl.includes('/n/') && afterUrl.includes('note.com')) {
+    if (noteUrl) {
       await browser.close();
-      return res.json({ success: true, url: afterUrl.split('?')[0] });
+      return res.json({ success: true, url: noteUrl });
     }
 
-    // note.com/api/v2/me でユーザー名を取得してURLを構築
+    // note.comトップページからユーザー名を取得
     if (noteId) {
-      // ページでnote.comのAPIを叩く（ブラウザのCookieが使われる）
-      await page.goto('https://note.com/api/v2/me', { waitUntil: 'domcontentloaded', timeout: 15000 });
-      const meText = await page.locator('body').innerText().catch(() => '{}');
-      console.log('/api/v2/me response (200):', meText.substring(0, 200));
+      await page.goto('https://note.com/', { waitUntil: 'domcontentloaded', timeout: 15000 });
 
-      let urlname = '';
-      try {
-        const meData = JSON.parse(meText);
-        urlname = meData.data?.urlname || meData.urlname || '';
-        console.log('urlname:', urlname);
-      } catch (e) {
-        console.log('meパースエラー:', e.message, 'raw:', meText.substring(0, 100));
-      }
-
-      if (urlname) {
-        const noteUrl = `https://note.com/${urlname}/n/${noteId}`;
-        await browser.close();
-        return res.json({ success: true, url: noteUrl });
-      }
-
-      // /api/v2/me失敗 → note.comホームからユーザー名を取得
-      await page.goto('https://note.com/', { waitUntil: 'networkidle', timeout: 15000 });
-      const homeUrl = page.url();
-      console.log('note.comホームURL:', homeUrl);
-
-      // ログイン済みなら /username のリダイレクト or リンクがある
-      const profileLink = await page.locator('a[href*="/dashboard"], a[href*="/settings"], [data-testid="user-icon"]').first();
-      if (await profileLink.isVisible({ timeout: 3000 }).catch(() => false)) {
-        const href = await profileLink.getAttribute('href').catch(() => '');
-        console.log('profileLink href:', href);
-        const unameMatch = href.match(/^\/([^/]+)/);
-        if (unameMatch) urlname = unameMatch[1];
-      }
+      // Next.jsの状態（__NEXT_DATA__）からユーザー名を取得
+      const urlname = await page.evaluate(() => {
+        try {
+          const nd = window.__NEXT_DATA__;
+          if (!nd) return '';
+          const props = nd.props || {};
+          const pp = props.pageProps || {};
+          return pp.currentUser?.urlname
+            || pp.user?.urlname
+            || props.currentUser?.urlname
+            || '';
+        } catch (e) {
+          return '';
+        }
+      }).catch(() => '');
+      console.log('__NEXT_DATA__ urlname:', urlname);
 
       if (urlname) {
-        const noteUrl = `https://note.com/${urlname}/n/${noteId}`;
         await browser.close();
-        return res.json({ success: true, url: noteUrl });
+        return res.json({ success: true, url: `https://note.com/${urlname}/n/${noteId}` });
+      }
+
+      // フォールバック: ページ内のリンクからユーザー名を推測
+      const profileLinks = await page.evaluate(() => {
+        return Array.from(document.querySelectorAll('a[href]'))
+          .map(a => a.getAttribute('href'))
+          .filter(h => h && /^\/[a-zA-Z0-9_]{2,30}$/.test(h))
+          .slice(0, 10);
+      }).catch(() => []);
+      console.log('profileLinks:', profileLinks);
+
+      // /dashboard, /settings 等を除外して最初のものをユーザー名として使用
+      const excludeRoutes = new Set(['login', 'signup', 'explore', 'search', 'notifications', 'my', 'settings', 'membership', 'magazine', 'topics', 'hashtag', 'n', 'tag']);
+      const candidateLink = profileLinks.find(h => {
+        const name = h.replace('/', '');
+        return !excludeRoutes.has(name);
+      });
+      const inferredUrlname = candidateLink ? candidateLink.replace('/', '') : '';
+      console.log('inferredUrlname:', inferredUrlname);
+
+      if (inferredUrlname) {
+        await browser.close();
+        return res.json({ success: true, url: `https://note.com/${inferredUrlname}/n/${noteId}` });
       }
 
       await browser.close();
@@ -263,7 +267,7 @@ app.post('/publish', async (req, res) => {
         success: false,
         error: 'ユーザー名取得失敗',
         noteId,
-        meResponseSample: meText.substring(0, 300)
+        profileLinks
       });
     }
 
