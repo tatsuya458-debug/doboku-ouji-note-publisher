@@ -114,7 +114,8 @@ app.post('/publish', async (req, res) => {
 
     await bodyEl.click();
     await page.keyboard.type(body, { delay: 2 });
-    await page.waitForTimeout(1000);
+    // 本文入力後、オートセーブが落ち着くまで待つ
+    await page.waitForTimeout(3000);
 
     // 投稿ボタン（1段階目：公開設定ページへ）
     const publishSelectors = [
@@ -155,7 +156,15 @@ app.post('/publish', async (req, res) => {
       console.log('waitForURL timeout, 現在URL:', page.url());
     }
 
-    await page.waitForTimeout(3000);
+    // 公開設定ページのボタンが表示されるまで待つ（最大10秒）
+    try {
+      await page.waitForSelector('button', { timeout: 10000 });
+      console.log('ボタン要素の存在確認');
+    } catch (e) {
+      console.log('ボタン待機タイムアウト');
+    }
+    await page.waitForTimeout(2000);
+
     const publishPageUrl = page.url();
     console.log('公開設定ページURL:', publishPageUrl);
 
@@ -213,24 +222,20 @@ app.post('/publish', async (req, res) => {
       return res.json({ success: true, url: noteUrl });
     }
 
-    // ユーザー名取得（優先順位順）
+    // ユーザー名取得
     let urlname = '';
 
     if (noteId) {
-      // 1) note.comトップページの__NEXT_DATA__スクリプトタグからJSON検索
       await page.goto('https://note.com/', { waitUntil: 'domcontentloaded', timeout: 15000 });
 
       urlname = await page.evaluate(() => {
         try {
-          // __NEXT_DATA__ のDOMエレメントから取得
           const el = document.getElementById('__NEXT_DATA__');
           if (el) {
             const str = el.textContent || '';
-            // "urlname":"xxxx" を検索
             const m = str.match(/"urlname":"([a-zA-Z0-9_]+)"/);
             if (m) return m[1];
           }
-          // scriptタグ全体からも検索
           const scripts = Array.from(document.querySelectorAll('script:not([src])'));
           for (const s of scripts) {
             const text = s.textContent || '';
@@ -242,7 +247,6 @@ app.post('/publish', async (req, res) => {
       }).catch(() => '');
       console.log('ページから取得したurlname:', urlname);
 
-      // 2) 環境変数 NOTE_USERNAME をフォールバックとして使用
       if (!urlname && process.env.NOTE_USERNAME) {
         urlname = process.env.NOTE_USERNAME;
         console.log('環境変数からurlname:', urlname);
@@ -253,13 +257,8 @@ app.post('/publish', async (req, res) => {
         return res.json({ success: true, url: `https://note.com/${urlname}/n/${noteId}` });
       }
 
-      // 3) ユーザー名が取れなかった場合もnoteIdは返す
       await browser.close();
-      return res.json({
-        success: false,
-        error: 'ユーザー名取得失敗（NOTE_USERNAME環境変数を設定してください）',
-        noteId
-      });
+      return res.json({ success: false, error: 'ユーザー名取得失敗', noteId });
     }
 
     await browser.close();
