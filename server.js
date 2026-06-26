@@ -147,7 +147,7 @@ app.post('/publish', async (req, res) => {
     await publishBtn.click();
     console.log('投稿ボタン1段階目クリック完了');
 
-    // 公開設定ページ（/publish/）へのURL変化を待つ
+    // 公開設定ページへのURL変化を待つ
     try {
       await page.waitForURL(/editor\.note\.com\/notes\/n[a-zA-Z0-9]+\/publish/, { timeout: 15000 });
       console.log('publishページURLに変化確認');
@@ -155,7 +155,6 @@ app.post('/publish', async (req, res) => {
       console.log('waitForURL timeout, 現在URL:', page.url());
     }
 
-    // ページが完全にレンダリングされるまで待つ
     await page.waitForTimeout(3000);
     const publishPageUrl = page.url();
     console.log('公開設定ページURL:', publishPageUrl);
@@ -187,7 +186,6 @@ app.post('/publish', async (req, res) => {
       }
     }
 
-    // 確認ボタンが見つからない場合、現在のボタン一覧を返す
     if (!confirmed) {
       const allButtons = await page.locator('button').all();
       const buttonInfos = [];
@@ -208,7 +206,7 @@ app.post('/publish', async (req, res) => {
     }
 
     // 投稿APIの完了を待つ
-    await page.waitForTimeout(8000);
+    await page.waitForTimeout(5000);
 
     // URL変化チェック
     const afterUrl = page.url();
@@ -218,39 +216,55 @@ app.post('/publish', async (req, res) => {
       return res.json({ success: true, url: afterUrl.split('?')[0] });
     }
 
-    // note.com APIでnote情報を取得
+    // note.com/api/v2/me でユーザー名を取得してURLを構築
     if (noteId) {
+      // ページでnote.comのAPIを叩く（ブラウザのCookieが使われる）
+      await page.goto('https://note.com/api/v2/me', { waitUntil: 'domcontentloaded', timeout: 15000 });
+      const meText = await page.locator('body').innerText().catch(() => '{}');
+      console.log('/api/v2/me response (200):', meText.substring(0, 200));
+
+      let urlname = '';
       try {
-        const apiResp = await context.request.get(`https://note.com/api/v2/notes/${noteId}`);
-        const apiStatus = apiResp.status();
-        const apiText = await apiResp.text();
-        console.log('API status:', apiStatus, 'response:', apiText.substring(0, 300));
-
-        const apiData = JSON.parse(apiText);
-        const key = apiData.data?.key || '';
-        const urlname = apiData.data?.user?.urlname || '';
-        const noteStatus = apiData.data?.status || '';
-        console.log('key:', key, 'urlname:', urlname, 'status:', noteStatus);
-
-        if (key && urlname) {
-          const noteUrl = `https://note.com/${urlname}/n/${key}`;
-          await browser.close();
-          return res.json({ success: true, url: noteUrl, status: noteStatus });
-        }
-
-        await browser.close();
-        return res.json({
-          success: false,
-          error: 'APIレスポンス不完全',
-          apiStatus,
-          apiSample: apiText.substring(0, 500),
-          noteId,
-          noteStatus
-        });
+        const meData = JSON.parse(meText);
+        urlname = meData.data?.urlname || meData.urlname || '';
+        console.log('urlname:', urlname);
       } catch (e) {
-        await browser.close();
-        return res.json({ success: false, error: 'APIエラー: ' + e.message, noteId });
+        console.log('meパースエラー:', e.message, 'raw:', meText.substring(0, 100));
       }
+
+      if (urlname) {
+        const noteUrl = `https://note.com/${urlname}/n/${noteId}`;
+        await browser.close();
+        return res.json({ success: true, url: noteUrl });
+      }
+
+      // /api/v2/me失敗 → note.comホームからユーザー名を取得
+      await page.goto('https://note.com/', { waitUntil: 'networkidle', timeout: 15000 });
+      const homeUrl = page.url();
+      console.log('note.comホームURL:', homeUrl);
+
+      // ログイン済みなら /username のリダイレクト or リンクがある
+      const profileLink = await page.locator('a[href*="/dashboard"], a[href*="/settings"], [data-testid="user-icon"]').first();
+      if (await profileLink.isVisible({ timeout: 3000 }).catch(() => false)) {
+        const href = await profileLink.getAttribute('href').catch(() => '');
+        console.log('profileLink href:', href);
+        const unameMatch = href.match(/^\/([^/]+)/);
+        if (unameMatch) urlname = unameMatch[1];
+      }
+
+      if (urlname) {
+        const noteUrl = `https://note.com/${urlname}/n/${noteId}`;
+        await browser.close();
+        return res.json({ success: true, url: noteUrl });
+      }
+
+      await browser.close();
+      return res.json({
+        success: false,
+        error: 'ユーザー名取得失敗',
+        noteId,
+        meResponseSample: meText.substring(0, 300)
+      });
     }
 
     await browser.close();
