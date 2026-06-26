@@ -199,13 +199,13 @@ app.post('/publish', async (req, res) => {
       return res.json({ success: false, error: '確認ボタンが見つかりません', noteId, publishPageUrl, buttons: buttonInfos });
     }
 
-    // 投稿完了を待つ（URL変化 or タイムアウト）
+    // 投稿完了を待つ
     let noteUrl = null;
     try {
       await page.waitForURL(/note\.com.*\/n\//, { timeout: 10000 });
       noteUrl = page.url().split('?')[0];
     } catch (e) {
-      console.log('URL変化なし、note IDから構築します');
+      console.log('URL変化なし、ユーザー名から構築します');
     }
 
     if (noteUrl) {
@@ -213,61 +213,52 @@ app.post('/publish', async (req, res) => {
       return res.json({ success: true, url: noteUrl });
     }
 
-    // note.comトップページからユーザー名を取得
+    // ユーザー名取得（優先順位順）
+    let urlname = '';
+
     if (noteId) {
+      // 1) note.comトップページの__NEXT_DATA__スクリプトタグからJSON検索
       await page.goto('https://note.com/', { waitUntil: 'domcontentloaded', timeout: 15000 });
 
-      // Next.jsの状態（__NEXT_DATA__）からユーザー名を取得
-      const urlname = await page.evaluate(() => {
+      urlname = await page.evaluate(() => {
         try {
-          const nd = window.__NEXT_DATA__;
-          if (!nd) return '';
-          const props = nd.props || {};
-          const pp = props.pageProps || {};
-          return pp.currentUser?.urlname
-            || pp.user?.urlname
-            || props.currentUser?.urlname
-            || '';
-        } catch (e) {
-          return '';
-        }
+          // __NEXT_DATA__ のDOMエレメントから取得
+          const el = document.getElementById('__NEXT_DATA__');
+          if (el) {
+            const str = el.textContent || '';
+            // "urlname":"xxxx" を検索
+            const m = str.match(/"urlname":"([a-zA-Z0-9_]+)"/);
+            if (m) return m[1];
+          }
+          // scriptタグ全体からも検索
+          const scripts = Array.from(document.querySelectorAll('script:not([src])'));
+          for (const s of scripts) {
+            const text = s.textContent || '';
+            const m = text.match(/"urlname":"([a-zA-Z0-9_]+)"/);
+            if (m) return m[1];
+          }
+        } catch (e) {}
+        return '';
       }).catch(() => '');
-      console.log('__NEXT_DATA__ urlname:', urlname);
+      console.log('ページから取得したurlname:', urlname);
+
+      // 2) 環境変数 NOTE_USERNAME をフォールバックとして使用
+      if (!urlname && process.env.NOTE_USERNAME) {
+        urlname = process.env.NOTE_USERNAME;
+        console.log('環境変数からurlname:', urlname);
+      }
 
       if (urlname) {
         await browser.close();
         return res.json({ success: true, url: `https://note.com/${urlname}/n/${noteId}` });
       }
 
-      // フォールバック: ページ内のリンクからユーザー名を推測
-      const profileLinks = await page.evaluate(() => {
-        return Array.from(document.querySelectorAll('a[href]'))
-          .map(a => a.getAttribute('href'))
-          .filter(h => h && /^\/[a-zA-Z0-9_]{2,30}$/.test(h))
-          .slice(0, 10);
-      }).catch(() => []);
-      console.log('profileLinks:', profileLinks);
-
-      // /dashboard, /settings 等を除外して最初のものをユーザー名として使用
-      const excludeRoutes = new Set(['login', 'signup', 'explore', 'search', 'notifications', 'my', 'settings', 'membership', 'magazine', 'topics', 'hashtag', 'n', 'tag']);
-      const candidateLink = profileLinks.find(h => {
-        const name = h.replace('/', '');
-        return !excludeRoutes.has(name);
-      });
-      const inferredUrlname = candidateLink ? candidateLink.replace('/', '') : '';
-      console.log('inferredUrlname:', inferredUrlname);
-
-      if (inferredUrlname) {
-        await browser.close();
-        return res.json({ success: true, url: `https://note.com/${inferredUrlname}/n/${noteId}` });
-      }
-
+      // 3) ユーザー名が取れなかった場合もnoteIdは返す
       await browser.close();
       return res.json({
         success: false,
-        error: 'ユーザー名取得失敗',
-        noteId,
-        profileLinks
+        error: 'ユーザー名取得失敗（NOTE_USERNAME環境変数を設定してください）',
+        noteId
       });
     }
 
