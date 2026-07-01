@@ -331,13 +331,31 @@ app.post('/publish', async (req, res) => {
     // Step 6: 公開設定ページへ
     // ============================================================
     console.log('公開設定ページへ移動...');
-    const pubBtn = page.locator('button:has-text("公開に進む")').first();
-    if (!await pubBtn.isVisible({ timeout: 5000 }).catch(() => false)) {
-      await browser.close();
-      return res.json({ success: false, error: '「公開に進む」ボタンが見つかりません' });
+    await dismissModals(page);
+    const pubBtnSelectors = [
+      'button:has-text("公開に進む")',
+      'button:has-text("公開設定へ")',
+      'button:has-text("投稿設定")',
+      'button:has-text("次へ")',
+    ];
+    let pubClicked = false;
+    for (const sel of pubBtnSelectors) {
+      const btn = page.locator(sel).first();
+      if (await btn.isVisible({ timeout: 3000 }).catch(() => false)) {
+        await btn.click();
+        pubClicked = true;
+        console.log('公開ボタンクリック:', sel);
+        break;
+      }
     }
-    await pubBtn.click();
-    await page.waitForTimeout(2500);
+    if (!pubClicked) {
+      const availableButtons = await page.evaluate(() =>
+        [...document.querySelectorAll('button')].map(b => b.textContent?.trim()).filter(Boolean).join(', ')
+      );
+      await browser.close();
+      return res.json({ success: false, error: '「公開に進む」ボタンが見つかりません。利用可能なボタン: ' + availableButtons });
+    }
+    await page.waitForTimeout(3500);
 
     // ============================================================
     // Step 7: タグ設定
@@ -400,27 +418,62 @@ app.post('/publish', async (req, res) => {
     // Step 9: 投稿実行
     // ============================================================
     console.log('投稿実行中...');
+    await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
+    await page.waitForTimeout(800);
+
     const postSelectors = [
       'button:has-text("投稿する")',
       'button:has-text("公開する")',
+      'button:has-text("今すぐ公開する")',
+      'button:has-text("今すぐ投稿する")',
       'button:has-text("投稿")',
       'button:has-text("公開")',
+      'button[type="submit"]',
     ];
 
     let posted = false;
     for (const sel of postSelectors) {
       const btn = page.locator(sel).last();
       if (await btn.isVisible({ timeout: 3000 }).catch(() => false)) {
-        await btn.click();
+        await btn.scrollIntoViewIfNeeded().catch(() => {});
+        await btn.click({ force: true });
         posted = true;
         console.log('投稿ボタンクリック:', sel);
         break;
       }
     }
 
+    // フォールバック：JavaScriptでボタンを探してクリック
     if (!posted) {
+      const clicked = await page.evaluate(() => {
+        const keywords = ['投稿する', '公開する', '今すぐ公開', '今すぐ投稿', '投稿', '公開'];
+        const buttons = [...document.querySelectorAll('button')];
+        for (const keyword of keywords) {
+          const btn = buttons.find(b =>
+            b.textContent?.trim().includes(keyword) &&
+            b.offsetParent !== null &&
+            !b.disabled
+          );
+          if (btn) {
+            console.log('JS fallback clicked:', btn.textContent?.trim());
+            btn.click();
+            return btn.textContent?.trim();
+          }
+        }
+        return null;
+      });
+      if (clicked) {
+        posted = true;
+        console.log('投稿ボタンをJSフォールバックでクリック:', clicked);
+      }
+    }
+
+    if (!posted) {
+      const availableButtons = await page.evaluate(() =>
+        [...document.querySelectorAll('button')].map(b => b.textContent?.trim()).filter(Boolean).join(', ')
+      );
       await browser.close();
-      return res.json({ success: false, error: '投稿ボタンが見つかりません' });
+      return res.json({ success: false, error: '投稿ボタンが見つかりません。利用可能なボタン: ' + availableButtons });
     }
 
     // ============================================================
