@@ -8,7 +8,15 @@ const crypto = require('crypto');
 const app = express();
 app.use(express.json({ limit: '50mb' }));
 
-app.get('/health', (req, res) => res.json({ ok: true }));
+// ============================================================
+// 同時実行ロック
+// Renderの無料枠（メモリ512MB）ではChromiumを2個同時に立ち上げると
+// メモリ超過でプロセスごとクラッシュ（502→再起動）する。
+// 投稿処理は一度に1件だけ許可し、実行中に来たリクエストは即「busy」で返す。
+// ============================================================
+let publishing = false;
+
+app.get('/health', (req, res) => res.json({ ok: true, busy: publishing }));
 
 // AIアシスタントモーダル等を閉じる
 async function dismissModals(page) {
@@ -89,6 +97,13 @@ app.post('/publish', async (req, res) => {
   if (!title || !body || !cookie) {
     return res.status(400).json({ success: false, error: 'title, body, cookie が必要です' });
   }
+
+  // 同時実行ガード：別の投稿処理が走っていたら、Chromiumを2個立ち上げず即座に返す
+  if (publishing) {
+    console.log('busy: 別の投稿処理を実行中のため受け付けませんでした');
+    return res.status(429).json({ success: false, busy: true, error: 'busy: 別の投稿処理を実行中です。しばらく待って再実行してください' });
+  }
+  publishing = true;
 
   // サムネイルを一時ファイルに保存
   let thumbPath = null;
@@ -512,6 +527,9 @@ app.post('/publish', async (req, res) => {
     if (thumbPath && existsSync(thumbPath)) { try { unlinkSync(thumbPath); } catch {} }
     console.error('エラー:', e.message);
     return res.json({ success: false, error: e.message });
+  } finally {
+    // 成功・失敗・例外いずれの場合もロックを必ず解放する
+    publishing = false;
   }
 });
 
