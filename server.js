@@ -27,9 +27,13 @@ const NOTE_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (K
 const searchUrl = (q, size) =>
   'https://note.com/api/v3/searches?context=note&q=' + encodeURIComponent(q) + '&size=' + size;
 
-app.get('/candidates', async (req, res) => {
-  const qs = String(req.query.q || '').split(',').map(s => s.trim()).filter(Boolean).slice(0, 5);
-  const size = Math.min(parseInt(req.query.size) || 10, 20);
+app.get('/candidates', (req, res) => candidatesHandler_(res, req.query || {}));
+app.post('/candidates', (req, res) => candidatesHandler_(res, req.body || {}));
+
+async function candidatesHandler_(res, p) {
+  const qs = String(p.q || '').split(',').map(s => s.trim()).filter(Boolean).slice(0, 5);
+  const size = Math.min(parseInt(p.size) || 10, 20);
+  const cookie = String(p.cookie || '');
   if (!qs.length) return res.status(400).json({ success: false, error: 'q required' });
 
   const results = {};
@@ -61,7 +65,16 @@ app.get('/candidates', async (req, res) => {
       browser = await chromium.launch({
         args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu', '--single-process']
       });
-      const page = await (await browser.newContext({ userAgent: NOTE_UA })).newPage();
+      const context = await browser.newContext({ userAgent: NOTE_UA });
+      // ログインCookieがあれば注入（認証済みセッションはWAFを通れる可能性が高い）
+      if (cookie) {
+        const parsed = cookie.split('; ').map(c => {
+          const i = c.indexOf('=');
+          return { name: c.substring(0, i).trim(), value: c.substring(i + 1).trim(), domain: '.note.com', path: '/' };
+        }).filter(c => c.name && c.value);
+        await context.addCookies(parsed).catch(() => {});
+      }
+      const page = await context.newPage();
       // まずnote.comのトップを普通に開いてWAFの検問を通過（Cookie取得）
       await page.goto('https://note.com/', { waitUntil: 'domcontentloaded', timeout: 30000 });
       await page.waitForTimeout(2500);
@@ -95,7 +108,7 @@ app.get('/candidates', async (req, res) => {
   }
 
   res.json({ success: true, results, debug });
-});
+}
 
 // AIアシスタントモーダル等を閉じる
 async function dismissModals(page) {
