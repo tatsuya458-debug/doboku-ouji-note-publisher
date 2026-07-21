@@ -18,6 +18,69 @@ let publishing = false;
 
 app.get('/health', (req, res) => res.json({ ok: true, busy: publishing }));
 
+// ============================================================
+// GET /candidates?q=kw1,kw2,kw3&size=10
+// note検索APIの代理取得（GASはnoteに直接アクセスすると403のため）
+// まず普通のfetchを試し、ダメなら実ブラウザ(Playwright)で取得する
+// ============================================================
+const NOTE_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
+const searchUrl = (q, size) =>
+  'https://note.com/api/v3/searches?context=note&q=' + encodeURIComponent(q) + '&size=' + size;
+
+app.get('/candidates', async (req, res) => {
+  const qs = String(req.query.q || '').split(',').map(s => s.trim()).filter(Boolean).slice(0, 5);
+  const size = Math.min(parseInt(req.query.size) || 10, 20);
+  if (!qs.length) return res.status(400).json({ success: false, error: 'q required' });
+
+  const results = {};
+  const needBrowser = [];
+
+  for (const q of qs) {
+    try {
+      const r = await fetch(searchUrl(q, size), { headers: { 'User-Agent': NOTE_UA, 'Accept': 'application/json' } });
+      if (r.ok) {
+        const json = await r.json();
+        results[q] = (json && json.data && json.data.notes && json.data.notes.contents) || [];
+        continue;
+      }
+      console.log('candidates: plain fetch HTTP' + r.status + ' (' + q + ')');
+    } catch (e) {
+      console.log('candidates: plain fetch failed (' + q + '): ' + e.message);
+    }
+    needBrowser.push(q);
+  }
+
+  if (needBrowser.length) {
+    if (publishing) {
+      // 投稿処理中はメモリ保護のためブラウザを追加起動しない
+      return res.json({ success: true, partial: true, results });
+    }
+    let browser;
+    try {
+      browser = await chromium.launch({
+        args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu', '--single-process']
+      });
+      const page = await (await browser.newContext({ userAgent: NOTE_UA })).newPage();
+      for (const q of needBrowser) {
+        try {
+          const resp = await page.goto(searchUrl(q, size), { timeout: 30000 });
+          const json = JSON.parse(await resp.text());
+          results[q] = (json && json.data && json.data.notes && json.data.notes.contents) || [];
+        } catch (e) {
+          console.log('candidates: browser fetch failed (' + q + '): ' + e.message);
+          results[q] = [];
+        }
+      }
+      await browser.close();
+    } catch (e) {
+      if (browser) await browser.close().catch(() => {});
+      console.log('candidates: browser launch failed: ' + e.message);
+    }
+  }
+
+  res.json({ success: true, results });
+});
+
 // AIアシスタントモーダル等を閉じる
 async function dismissModals(page) {
   try {
