@@ -50,6 +50,7 @@ app.get('/candidates', async (req, res) => {
     needBrowser.push(q);
   }
 
+  const debug = [];
   if (needBrowser.length) {
     if (publishing) {
       // 投稿処理中はメモリ保護のためブラウザを追加起動しない
@@ -61,13 +62,27 @@ app.get('/candidates', async (req, res) => {
         args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu', '--single-process']
       });
       const page = await (await browser.newContext({ userAgent: NOTE_UA })).newPage();
+      // まずnote.comのトップを普通に開いてWAFの検問を通過（Cookie取得）
+      await page.goto('https://note.com/', { waitUntil: 'domcontentloaded', timeout: 30000 });
+      await page.waitForTimeout(2500);
+      // その画面の中から同一オリジンでAPIを呼ぶ（本物のブラウザ由来のリクエストになる）
       for (const q of needBrowser) {
         try {
-          const resp = await page.goto(searchUrl(q, size), { timeout: 30000 });
-          const json = JSON.parse(await resp.text());
-          results[q] = (json && json.data && json.data.notes && json.data.notes.contents) || [];
+          const path = '/api/v3/searches?context=note&q=' + encodeURIComponent(q) + '&size=' + size;
+          const out = await page.evaluate(async (p) => {
+            const r = await fetch(p, { headers: { 'Accept': 'application/json' } });
+            return { s: r.status, t: await r.text() };
+          }, path);
+          debug.push(q + ':HTTP' + out.s);
+          if (out.s === 200) {
+            const json = JSON.parse(out.t);
+            results[q] = (json && json.data && json.data.notes && json.data.notes.contents) || [];
+          } else {
+            results[q] = [];
+          }
         } catch (e) {
-          console.log('candidates: browser fetch failed (' + q + '): ' + e.message);
+          console.log('candidates: in-page fetch failed (' + q + '): ' + e.message);
+          debug.push(q + ':ERR ' + String(e.message).slice(0, 60));
           results[q] = [];
         }
       }
@@ -75,10 +90,11 @@ app.get('/candidates', async (req, res) => {
     } catch (e) {
       if (browser) await browser.close().catch(() => {});
       console.log('candidates: browser launch failed: ' + e.message);
+      debug.push('launch:ERR ' + String(e.message).slice(0, 60));
     }
   }
 
-  res.json({ success: true, results });
+  res.json({ success: true, results, debug });
 });
 
 // AIアシスタントモーダル等を閉じる
