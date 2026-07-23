@@ -25,7 +25,7 @@ app.get('/health', (req, res) => res.json({ ok: true, busy: publishing }));
 // ============================================================
 const NOTE_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
 const searchUrl = (q, size) =>
-  'https://note.com/api/v3/searches?context=note&q=' + encodeURIComponent(q) + '&size=' + size;
+  'https://note.com/api/v3/searches?context=note&q=' + encodeURIComponent(q) + '&size=' + size + '&sort=new';
 
 app.get('/candidates', (req, res) => candidatesHandler_(res, req.query || {}));
 app.post('/candidates', (req, res) => candidatesHandler_(res, req.body || {}));
