@@ -81,7 +81,7 @@ async function candidatesHandler_(res, p) {
       // その画面の中から同一オリジンでAPIを呼ぶ（本物のブラウザ由来のリクエストになる）
       for (const q of needBrowser) {
         try {
-          const path = '/api/v3/searches?context=note&q=' + encodeURIComponent(q) + '&size=' + size;
+          const path = '/api/v3/searches?context=note&q=' + encodeURIComponent(q) + '&size=' + size + '&sort=new';
           const out = await page.evaluate(async (p) => {
             const r = await fetch(p, { headers: { 'Accept': 'application/json' } });
             return { s: r.status, t: await r.text() };
