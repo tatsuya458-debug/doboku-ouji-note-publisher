@@ -166,6 +166,53 @@ async function typeRichText(page, text) {
 }
 
 // ============================================================
+// POST /stats  … noteダッシュボード統計の代理取得
+// Body: { cookie: string, pages?: number }
+// 要ログインAPIのため、実ブラウザにCookieを注入してページ内から取得する
+// ============================================================
+app.post('/stats', async (req, res) => {
+  const cookie = String((req.body || {}).cookie || '');
+  const pages = Math.min(parseInt((req.body || {}).pages) || 3, 5);
+  if (!cookie) return res.status(400).json({ success: false, error: 'cookie required' });
+  if (publishing) return res.status(429).json({ success: false, busy: true, error: 'busy' });
+
+  let browser;
+  try {
+    browser = await chromium.launch({
+      args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu', '--single-process']
+    });
+    const context = await browser.newContext({ userAgent: NOTE_UA });
+    const parsed = cookie.split('; ').map(c => {
+      const i = c.indexOf('=');
+      return { name: c.substring(0, i).trim(), value: c.substring(i + 1).trim(), domain: '.note.com', path: '/' };
+    }).filter(c => c.name && c.value);
+    await context.addCookies(parsed).catch(() => {});
+    const page = await context.newPage();
+    await page.goto('https://note.com/', { waitUntil: 'domcontentloaded', timeout: 30000 });
+    await page.waitForTimeout(2500);
+
+    const results = [];
+    for (let p = 1; p <= pages; p++) {
+      const out = await page.evaluate(async (pp) => {
+        const r = await fetch('/api/v1/stats/pv?filter=all&page=' + pp + '&sort=pv', { headers: { 'Accept': 'application/json' } });
+        return { s: r.status, t: await r.text() };
+      }, p);
+      if (out.s !== 200) { results.push({ page: p, status: out.s }); break; }
+      try {
+        results.push({ page: p, status: 200, body: JSON.parse(out.t) });
+      } catch (e) {
+        results.push({ page: p, status: 200, parseError: true, raw: String(out.t).slice(0, 300) });
+      }
+    }
+    await browser.close();
+    res.json({ success: true, pages: results });
+  } catch (e) {
+    if (browser) await browser.close().catch(() => {});
+    res.json({ success: false, error: e.message });
+  }
+});
+
+// ============================================================
 // POST /publish
 // Body: {
 //   title: string,
