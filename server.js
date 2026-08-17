@@ -214,7 +214,11 @@ app.post('/stats', async (req, res) => {
 
 // ============================================================
 // ============================================================
-// note.com 自動ログイン（Cookie切れの手動更新を不要にする・2026-08-17追加）
+// note.com 自動ログイン（2026-08-17追加）
+// ※ note.comのログイン画面はreCAPTCHA必須のため、通常は失敗する。
+//    CAPTCHAの自動突破は行わない（規約違反・アカウント凍結リスクのため）。
+//    Cookie維持の本命は /publish 時のセッション延命（毎回Cookieを取り直す）。
+//    この関数は将来noteの仕様が変わった場合と、原因診断のために残してある。
 // 認証情報はRenderの環境変数から読む（コードにもGASにも保存しない）
 //   NOTE_EMAIL    : note.comのログインメールアドレス
 //   NOTE_PASSWORD : note.comのパスワード
@@ -778,6 +782,18 @@ app.post('/publish', async (req, res) => {
         noteUrl = `https://note.com/${urlname}/n/${noteId}`;
         console.log('URLをnoteIdから構築:', noteUrl);
       }
+    }
+
+    // ── セッション延命（2026-08-17）────────────────────────────
+    // note.comのログインはreCAPTCHA必須で自動ログインできない。
+    // その代わり、投稿のたびに“今まさに有効なCookie”を取り直してGASに返す。
+    // noteのセッションはアクセスのたびに有効期限が延びるため、毎日投稿している限り
+    // Cookieが切れず、手動での貼り替えが実質不要になる（CAPTCHAは一切通らない）
+    try {
+      const fresh = cookieStringFrom_(await context.cookies());
+      if (fresh) refreshedCookie = fresh;
+    } catch (e) {
+      console.log('Cookie再取得スキップ:', e.message);
     }
 
     await browser.close();
