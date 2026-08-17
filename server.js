@@ -213,6 +213,96 @@ app.post('/stats', async (req, res) => {
 });
 
 // ============================================================
+// ============================================================
+// note.com 自動ログイン（Cookie切れの手動更新を不要にする・2026-08-17追加）
+// 認証情報はRenderの環境変数から読む（コードにもGASにも保存しない）
+//   NOTE_EMAIL    : note.comのログインメールアドレス
+//   NOTE_PASSWORD : note.comのパスワード
+// ============================================================
+function cookieStringFrom_(cookies) {
+  return cookies
+    .filter(c => /note\.com$/.test(c.domain.replace(/^\./, '')) || c.domain.includes('note.com'))
+    .map(c => `${c.name}=${c.value}`)
+    .join('; ');
+}
+
+// 既存のページを使ってログインする（ブラウザを増やさない＝512MBのメモリを守る）
+async function noteLogin_(page) {
+  const email = process.env.NOTE_EMAIL;
+  const password = process.env.NOTE_PASSWORD;
+  if (!email || !password) {
+    return { success: false, error: 'NOTE_EMAIL / NOTE_PASSWORD が未設定（Renderの環境変数に登録してください）' };
+  }
+
+  try {
+    console.log('note.com 自動ログイン開始');
+    await page.goto('https://note.com/login', { waitUntil: 'domcontentloaded', timeout: 30000 });
+    await page.waitForTimeout(2000);
+
+    const emailBox = page.locator('input[name="email"], input#email, input[type="email"]').first();
+    const passBox  = page.locator('input[name="password"], input#password, input[type="password"]').first();
+    if (!(await emailBox.isVisible({ timeout: 10000 }).catch(() => false))) {
+      return { success: false, error: 'ログインフォームが見つかりません（note.comの画面変更の可能性）' };
+    }
+
+    await emailBox.fill(email);
+    await passBox.fill(password);
+    await page.waitForTimeout(500);
+
+    const loginBtn = page.locator('button:has-text("ログイン"), button[type="submit"]').first();
+    if (await loginBtn.isVisible({ timeout: 5000 }).catch(() => false)) {
+      await loginBtn.click();
+    } else {
+      await passBox.press('Enter');
+    }
+
+    // ログイン完了（/loginから離れる）まで待つ
+    await page.waitForURL(u => !String(u).includes('/login'), { timeout: 30000 }).catch(() => {});
+    await page.waitForTimeout(3000);
+
+    if (page.url().includes('/login')) {
+      // 2段階認証・CAPTCHA・パスワード誤りなどで進めなかった
+      return { success: false, error: '自動ログインが完了しませんでした（2段階認証・CAPTCHA・パスワード誤りの可能性）' };
+    }
+
+    const cookies = await page.context().cookies();
+    const cookieStr = cookieStringFrom_(cookies);
+    if (!cookieStr) return { success: false, error: 'ログイン後のCookieを取得できませんでした' };
+
+    console.log('note.com 自動ログイン成功');
+    return { success: true, cookie: cookieStr };
+  } catch (e) {
+    return { success: false, error: '自動ログインエラー: ' + e.message };
+  }
+}
+
+// ============================================================
+// POST /login … 新しいセッションCookieを取得して返す（GASが保存する）
+// ============================================================
+app.post('/login', async (req, res) => {
+  if (publishing) {
+    return res.status(429).json({ success: false, busy: true, error: 'busy: 別の処理を実行中です' });
+  }
+  publishing = true;
+
+  let browser;
+  try {
+    browser = await chromium.launch({
+      args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu', '--single-process']
+    });
+    const context = await browser.newContext({ userAgent: NOTE_UA, viewport: { width: 1280, height: 800 } });
+    const page = await context.newPage();
+    const r = await noteLogin_(page);
+    res.json(r);
+  } catch (e) {
+    res.status(500).json({ success: false, error: e.message });
+  } finally {
+    if (browser) await browser.close().catch(() => {});
+    publishing = false;
+  }
+});
+
+// ============================================================
 // POST /publish
 // Body: {
 //   title: string,
@@ -243,6 +333,9 @@ app.post('/publish', async (req, res) => {
     return res.status(429).json({ success: false, busy: true, error: 'busy: 別の投稿処理を実行中です。しばらく待って再実行してください' });
   }
   publishing = true;
+
+  // Cookie切れで自動ログインした場合、新しいCookieをGASに返して保存させる
+  let refreshedCookie = null;
 
   // サムネイルを一時ファイルに保存
   let thumbPath = null;
@@ -300,9 +393,21 @@ app.post('/publish', async (req, res) => {
     await page.goto('https://note.com/notes/new', { waitUntil: 'networkidle', timeout: 30000 });
     await page.waitForTimeout(3000);
 
+    // Cookie切れなら、その場で自動ログインして続行する（手動更新を不要にする）
     if (page.url().includes('/login') || page.url().includes('/signin') || page.url().includes('/sign_in')) {
-      await browser.close();
-      return res.json({ success: false, error: 'Cookie切れ。setNoteCookie()を再実行してください' });
+      console.log('Cookie切れを検知 → 自動ログインを試みます');
+      const lg = await noteLogin_(page);
+      if (!lg.success) {
+        await browser.close();
+        return res.json({ success: false, error: 'Cookie切れ。自動ログインも失敗しました: ' + lg.error });
+      }
+      refreshedCookie = lg.cookie; // 成功したらGASに返して保存させる
+      await page.goto('https://note.com/notes/new', { waitUntil: 'networkidle', timeout: 30000 });
+      await page.waitForTimeout(3000);
+      if (page.url().includes('/login')) {
+        await browser.close();
+        return res.json({ success: false, error: '自動ログイン後もエディターを開けませんでした' });
+      }
     }
 
     const editorUrl = page.url();
@@ -657,9 +762,9 @@ app.post('/publish', async (req, res) => {
     if (thumbPath && existsSync(thumbPath)) { try { unlinkSync(thumbPath); } catch {} }
 
     if (noteUrl) {
-      return res.json({ success: true, url: noteUrl });
+      return res.json({ success: true, url: noteUrl, newCookie: refreshedCookie });
     }
-    return res.json({ success: false, error: '投稿完了したがURL取得失敗' });
+    return res.json({ success: false, error: '投稿完了したがURL取得失敗', newCookie: refreshedCookie });
 
   } catch (e) {
     if (browser) await browser.close().catch(() => {});
