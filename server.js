@@ -249,11 +249,17 @@ async function noteLogin_(page) {
     await passBox.fill(password);
     await page.waitForTimeout(500);
 
-    const loginBtn = page.locator('button:has-text("ログイン"), button[type="submit"]').first();
-    if (await loginBtn.isVisible({ timeout: 5000 }).catch(() => false)) {
-      await loginBtn.click();
+    // ヘッダーの「ログイン」リンク等を誤クリックしないよう、フォーム内の送信ボタンを優先する
+    const submitBtn = page.locator('form button[type="submit"], form button:has-text("ログイン")').first();
+    if (await submitBtn.isVisible({ timeout: 5000 }).catch(() => false)) {
+      await submitBtn.click().catch(() => {});
     } else {
-      await passBox.press('Enter');
+      const anyBtn = page.locator('button[type="submit"], button:has-text("ログイン")').last();
+      if (await anyBtn.isVisible({ timeout: 3000 }).catch(() => false)) {
+        await anyBtn.click().catch(() => {});
+      } else {
+        await passBox.press('Enter');
+      }
     }
 
     // ログイン完了（/loginから離れる）まで待つ
@@ -261,8 +267,24 @@ async function noteLogin_(page) {
     await page.waitForTimeout(3000);
 
     if (page.url().includes('/login')) {
-      // 2段階認証・CAPTCHA・パスワード誤りなどで進めなかった
-      return { success: false, error: '自動ログインが完了しませんでした（2段階認証・CAPTCHA・パスワード誤りの可能性）' };
+      // 進めなかった原因を画面から拾って返す（パスワード誤り/CAPTCHA/仕様変更の切り分け用）
+      let diag = '';
+      try {
+        diag = await page.evaluate(() => {
+          const pick = [];
+          document.querySelectorAll('[role="alert"], .error, .errorText, .m-error, p, span, div').forEach(el => {
+            const t = (el.textContent || '').trim();
+            if (!t || t.length > 80) return;
+            if (/パスワード|メールアドレス|一致しません|正しく|認証|エラー|ロボット|確認/.test(t)) {
+              if (pick.indexOf(t) < 0 && el.offsetParent !== null) pick.push(t);
+            }
+          });
+          const captcha = !!document.querySelector('iframe[src*="recaptcha"], iframe[src*="hcaptcha"], .g-recaptcha');
+          return JSON.stringify({ messages: pick.slice(0, 6), captcha: captcha, url: location.href });
+        });
+      } catch (e) { diag = 'diag取得失敗: ' + e.message; }
+      console.log('自動ログイン失敗の診断:', diag);
+      return { success: false, error: '自動ログインが完了しませんでした', diagnostic: diag };
     }
 
     const cookies = await page.context().cookies();
