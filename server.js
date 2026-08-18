@@ -55,6 +55,8 @@ async function candidatesHandler_(res, p) {
   }
 
   const debug = [];
+  let newCookie = null;        // 延命したCookie（GASが保存する）
+  let sessionExpired = false;  // ログイン切れを検知したらtrue（GASが早期通知に使う）
   if (needBrowser.length) {
     if (publishing) {
       // 投稿処理中はメモリ保護のためブラウザを追加起動しない
@@ -99,6 +101,23 @@ async function candidatesHandler_(res, p) {
           results[q] = [];
         }
       }
+      // セッション延命：ログイン済みでアクセスした結果、更新されたCookieを持ち帰る
+      // （1日2回の候補取得でも延命されるので、投稿が数日止まってもCookieが切れにくくなる）
+      try {
+        const currentUser = await page.evaluate(async () => {
+          const r = await fetch('/api/v2/current_user', { headers: { 'Accept': 'application/json' } });
+          return r.status;
+        });
+        debug.push('session:HTTP' + currentUser);
+        if (currentUser === 200) {
+          const fresh = cookieStringFrom_(await context.cookies());
+          if (fresh) newCookie = fresh;
+        } else {
+          sessionExpired = true;
+        }
+      } catch (e) {
+        debug.push('session:ERR ' + String(e.message).slice(0, 60));
+      }
       await browser.close();
     } catch (e) {
       if (browser) await browser.close().catch(() => {});
@@ -107,7 +126,7 @@ async function candidatesHandler_(res, p) {
     }
   }
 
-  res.json({ success: true, results, debug });
+  res.json({ success: true, results, debug, newCookie, sessionExpired });
 }
 
 // AIアシスタントモーダル等を閉じる
@@ -425,7 +444,7 @@ app.post('/publish', async (req, res) => {
       const lg = await noteLogin_(page);
       if (!lg.success) {
         await browser.close();
-        return res.json({ success: false, error: 'Cookie切れ。自動ログインも失敗しました: ' + lg.error });
+        return res.json({ success: false, error: 'Cookie切れ（ログインセッション期限切れ）。setNoteCookie()で更新してください' });
       }
       refreshedCookie = lg.cookie; // 成功したらGASに返して保存させる
       await page.goto('https://note.com/notes/new', { waitUntil: 'networkidle', timeout: 30000 });
