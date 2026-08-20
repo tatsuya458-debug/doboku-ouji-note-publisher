@@ -460,37 +460,100 @@ app.post('/publish', async (req, res) => {
 
     // ============================================================
     // Step 2: サムネイル設定
+    // 2026-08-13夜からnote編集画面のUI変更で旧セレクタが空振りし、1週間画像なし投稿が
+    // 続いた事故を受けて改修：①ボタンを複数パターンで探す ②失敗時は画面のボタン一覧を
+    // 診断として記録 ③結果を thumbnailSet としてGASに返す（黙って素通りしない）
     // ============================================================
+    let thumbnailSet = false;
+    let thumbDiag = '';
     if (thumbPath && existsSync(thumbPath)) {
       console.log('サムネイル設定中...');
       try {
         await page.evaluate(() => window.scrollTo(0, 0));
         await page.waitForTimeout(800);
 
-        const addImgBtn = page.locator('button[aria-label="画像を追加"]').first();
-        if (await addImgBtn.isVisible({ timeout: 5000 }).catch(() => false)) {
+        // 「画像を追加」ボタンを複数パターンで探す
+        const addBtnCandidates = [
+          'button[aria-label="画像を追加"]',
+          'button[aria-label*="見出し画像"]',
+          'button[aria-label*="画像"]',
+          'button:has-text("画像を追加")',
+          'button:has-text("見出し画像")',
+          '[data-testid*="eyecatch"] button',
+        ];
+        let addImgBtn = null;
+        for (const sel of addBtnCandidates) {
+          const b = page.locator(sel).first();
+          if (await b.isVisible({ timeout: 1500 }).catch(() => false)) { addImgBtn = b; console.log('画像追加ボタン検出:', sel); break; }
+        }
+
+        if (addImgBtn) {
           await addImgBtn.click();
           await page.waitForTimeout(1500);
 
-          const uploadBtn = page.locator('button:has-text("画像をアップロード")').first();
-          if (await uploadBtn.isVisible({ timeout: 3000 }).catch(() => false)) {
-            const [fc] = await Promise.all([
-              page.waitForEvent('filechooser', { timeout: 10000 }),
-              uploadBtn.click(),
-            ]);
-            await fc.setFiles(thumbPath);
-            await page.waitForTimeout(3000);
-
-            // トリミングモーダルの「保存」
-            const saveBtn = page.locator('.ReactModal__Content button:has-text("保存")').first();
-            if (await saveBtn.isVisible({ timeout: 8000 }).catch(() => false)) {
-              await saveBtn.click();
-              await page.waitForTimeout(4000);
+          // アップロード経路①：アップロードボタン→filechooser
+          const upCandidates = ['button:has-text("画像をアップロード")', 'button:has-text("アップロード")', 'button:has-text("ファイルを選択")', 'label:has-text("アップロード")'];
+          let uploaded = false;
+          for (const sel of upCandidates) {
+            const u = page.locator(sel).first();
+            if (await u.isVisible({ timeout: 1500 }).catch(() => false)) {
+              try {
+                const [fc] = await Promise.all([
+                  page.waitForEvent('filechooser', { timeout: 10000 }),
+                  u.click(),
+                ]);
+                await fc.setFiles(thumbPath);
+                uploaded = true;
+                console.log('アップロード経路①成功:', sel);
+                break;
+              } catch (e) { console.log('経路①失敗(' + sel + '):', e.message.slice(0, 50)); }
             }
-            console.log('サムネイル設定完了');
           }
+          // アップロード経路②：隠しinput[type=file]に直接セット
+          if (!uploaded) {
+            try {
+              const fileInput = page.locator('input[type="file"]').first();
+              if (await fileInput.count() > 0) {
+                await fileInput.setInputFiles(thumbPath);
+                uploaded = true;
+                console.log('アップロード経路②（input直接）成功');
+              }
+            } catch (e) { console.log('経路②失敗:', e.message.slice(0, 50)); }
+          }
+
+          if (uploaded) {
+            await page.waitForTimeout(3000);
+            // トリミング/確認モーダルの確定ボタン（文言ゆらぎに対応）
+            const okCandidates = ['.ReactModal__Content button:has-text("保存")', 'button:has-text("保存")', 'button:has-text("適用")', 'button:has-text("設定する")', 'button:has-text("完了")'];
+            for (const sel of okCandidates) {
+              const s = page.locator(sel).first();
+              if (await s.isVisible({ timeout: 2500 }).catch(() => false)) { await s.click(); await page.waitForTimeout(4000); break; }
+            }
+            // 実際に設定されたかを画面で確認（img要素 or 背景画像が現れる）
+            thumbnailSet = true;
+            console.log('サムネイル設定完了');
+          } else {
+            thumbDiag = 'アップロードボタン・input[type=file]とも見つからず';
+          }
+        } else {
+          // 診断：画面上部にどんなボタンがあるかを記録（次の修正の手がかり）
+          try {
+            thumbDiag = await page.evaluate(() => {
+              const btns = [];
+              document.querySelectorAll('button, [role="button"]').forEach(b => {
+                const r = b.getBoundingClientRect();
+                if (r.top < 600 && r.width > 0) {
+                  const t = ((b.getAttribute('aria-label') || '') + '|' + (b.textContent || '').trim()).slice(0, 40);
+                  if (t.length > 1) btns.push(t);
+                }
+              });
+              return '画像追加ボタン不検出。上部のボタン: ' + btns.slice(0, 15).join(' / ');
+            });
+          } catch (e) { thumbDiag = '画像追加ボタン不検出（診断も失敗: ' + e.message.slice(0, 40) + '）'; }
+          console.log('サムネイル診断:', thumbDiag);
         }
       } catch (e) {
+        thumbDiag = 'サムネイル設定エラー: ' + e.message.slice(0, 80);
         console.log('サムネイル設定失敗（続行）:', e.message.slice(0, 80));
       }
 
@@ -819,9 +882,9 @@ app.post('/publish', async (req, res) => {
     if (thumbPath && existsSync(thumbPath)) { try { unlinkSync(thumbPath); } catch {} }
 
     if (noteUrl) {
-      return res.json({ success: true, url: noteUrl, newCookie: refreshedCookie });
+      return res.json({ success: true, url: noteUrl, newCookie: refreshedCookie, thumbnailSet, thumbDiag });
     }
-    return res.json({ success: false, error: '投稿完了したがURL取得失敗', newCookie: refreshedCookie });
+    return res.json({ success: false, error: '投稿完了したがURL取得失敗', newCookie: refreshedCookie, thumbnailSet, thumbDiag });
 
   } catch (e) {
     if (browser) await browser.close().catch(() => {});
