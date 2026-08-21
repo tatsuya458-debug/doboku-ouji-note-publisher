@@ -398,15 +398,17 @@ app.post('/probe', async (req, res) => {
     const results = [];
     results.push(await scan(page, '1_editor_initial'));
 
-    // タイトル上部にホバーして隠しUIが出るか
+    // 「画像を追加」(svg)をクリックしてモーダルの中身を確認
     try {
-      const title = page.locator('textarea[placeholder*="タイトル"], [data-placeholder*="タイトル"]').first();
-      if (await title.count() > 0) {
-        const box = await title.boundingBox();
-        if (box) { await page.mouse.move(box.x + box.width / 2, Math.max(10, box.y - 60)); await page.waitForTimeout(1500); }
+      const add = page.locator('[aria-label="画像を追加"]').first();
+      if (await add.count() > 0) {
+        await add.click();
+        await page.waitForTimeout(2000);
+        results.push(await scan(page, '2_after_click_add_image'));
+      } else {
+        results.push({ label: '2_no_add_image_element' });
       }
-      results.push(await scan(page, '2_after_hover_above_title'));
-    } catch (e) { results.push({ label: '2_hover_error', error: e.message.slice(0, 60) }); }
+    } catch (e) { results.push({ label: '2_click_error', error: e.message.slice(0, 60) }); }
 
     // ダミータイトルを入れて「公開に進む」画面のUIを見る（投稿はしない）
     try {
