@@ -348,6 +348,92 @@ app.post('/login', async (req, res) => {
 });
 
 // ============================================================
+// POST /probe … note編集画面のUI構造を調査する診断用（投稿はしない）
+// 2026-08-21: UI変更で見出し画像の設定場所が消えたため、実画面から探すために追加
+// ============================================================
+app.post('/probe', async (req, res) => {
+  const cookie = String((req.body || {}).cookie || '');
+  if (!cookie) return res.status(400).json({ success: false, error: 'cookie required' });
+  if (publishing) return res.status(429).json({ success: false, busy: true });
+  publishing = true;
+
+  const scan = async (page, label) => {
+    return await page.evaluate((lbl) => {
+      const out = { label: lbl, url: location.href, imageRelated: [], buttons: [] };
+      const seen = new Set();
+      document.querySelectorAll('*').forEach(el => {
+        const aria = el.getAttribute && (el.getAttribute('aria-label') || '');
+        const text = (el.childElementCount === 0 ? (el.textContent || '') : '').trim();
+        const hay = (aria + ' ' + text);
+        if (/画像|アイキャッチ|eyecatch|サムネ/i.test(hay)) {
+          const r = el.getBoundingClientRect();
+          const desc = el.tagName + (el.className && typeof el.className === 'string' ? '.' + el.className.split(' ').slice(0,2).join('.') : '') +
+                       ' aria="' + aria.slice(0,30) + '" text="' + text.slice(0,30) + '" vis=' + (r.width > 0 && r.height > 0) +
+                       ' pos=' + Math.round(r.top) + ',' + Math.round(r.left);
+          if (!seen.has(desc)) { seen.add(desc); out.imageRelated.push(desc); }
+        }
+      });
+      document.querySelectorAll('button, [role="button"], label, input[type="file"]').forEach(el => {
+        const r = el.getBoundingClientRect();
+        const aria = el.getAttribute('aria-label') || '';
+        const text = (el.textContent || '').trim().slice(0, 25);
+        const desc = el.tagName + ' "' + (aria || text) + '" vis=' + (r.width > 0) + ' top=' + Math.round(r.top);
+        if ((aria || text || el.tagName === 'INPUT') && out.buttons.length < 40) out.buttons.push(desc);
+      });
+      return out;
+    }, label);
+  };
+
+  let browser;
+  try {
+    browser = await chromium.launch({ args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu', '--single-process'] });
+    const context = await browser.newContext({ userAgent: NOTE_UA, viewport: { width: 1280, height: 800 } });
+    const parsed = cookie.split('; ').map(c => { const i = c.indexOf('='); return { name: c.substring(0, i).trim(), value: c.substring(i + 1).trim(), path: '/' }; }).filter(c => c.name && c.value);
+    await context.addCookies([...parsed.map(c => ({ ...c, domain: '.note.com' })), ...parsed.map(c => ({ ...c, domain: 'editor.note.com' }))]);
+    const page = await context.newPage();
+    await page.goto('https://note.com/notes/new', { waitUntil: 'networkidle', timeout: 30000 });
+    await page.waitForTimeout(3000);
+    if (page.url().includes('/login')) { await browser.close(); publishing = false; return res.json({ success: false, error: 'cookie expired' }); }
+
+    const results = [];
+    results.push(await scan(page, '1_editor_initial'));
+
+    // タイトル上部にホバーして隠しUIが出るか
+    try {
+      const title = page.locator('textarea[placeholder*="タイトル"], [data-placeholder*="タイトル"]').first();
+      if (await title.count() > 0) {
+        const box = await title.boundingBox();
+        if (box) { await page.mouse.move(box.x + box.width / 2, Math.max(10, box.y - 60)); await page.waitForTimeout(1500); }
+      }
+      results.push(await scan(page, '2_after_hover_above_title'));
+    } catch (e) { results.push({ label: '2_hover_error', error: e.message.slice(0, 60) }); }
+
+    // ダミータイトルを入れて「公開に進む」画面のUIを見る（投稿はしない）
+    try {
+      const titleSel = 'textarea[placeholder*="タイトル"], [data-placeholder*="タイトル"]';
+      await page.fill(titleSel, 'probe');
+      await page.waitForTimeout(800);
+      const pubBtn = page.locator('button:has-text("公開に進む")').first();
+      if (await pubBtn.isVisible({ timeout: 3000 }).catch(() => false)) {
+        await pubBtn.click();
+        await page.waitForTimeout(3500);
+        results.push(await scan(page, '3_publish_screen'));
+      } else {
+        results.push({ label: '3_no_publish_button' });
+      }
+    } catch (e) { results.push({ label: '3_publish_error', error: e.message.slice(0, 60) }); }
+
+    await browser.close();
+    res.json({ success: true, results });
+  } catch (e) {
+    if (browser) await browser.close().catch(() => {});
+    res.status(500).json({ success: false, error: e.message });
+  } finally {
+    publishing = false;
+  }
+});
+
+// ============================================================
 // POST /publish
 // Body: {
 //   title: string,
