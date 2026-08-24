@@ -411,6 +411,23 @@ app.post('/probe', async (req, res) => {
     const results = [];
     results.push(await scan(page, '1_editor_initial'));
 
+    // 追加待機して再スキャン（遅延レンダリング対策）＋タイトル周辺の実HTMLを取得
+    await page.waitForTimeout(6000);
+    const late = await scan(page, '1b_after_9s');
+    try {
+      late.headerHtml = await page.evaluate(() => {
+        const t = document.querySelector('textarea[placeholder*="タイトル"], [data-placeholder*="タイトル"]');
+        if (!t) return 'no-title-element';
+        let node = t;
+        for (let i = 0; i < 4 && node.parentElement; i++) node = node.parentElement;
+        return node.outerHTML.replace(/\s+/g, ' ').slice(0, 1800);
+      });
+      late.svgAria = await page.evaluate(() =>
+        [...document.querySelectorAll('svg[aria-label]')].map(s => s.getAttribute('aria-label')).slice(0, 20)
+      );
+    } catch (e) { late.htmlError = e.message.slice(0, 60); }
+    results.push(late);
+
     // 本番(/publish)と同一のセレクタリストで探し、どれがヒットするか報告してからクリック
     try {
       let matched = null, add = null;
