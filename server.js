@@ -24,6 +24,19 @@ app.get('/health', (req, res) => res.json({ ok: true, busy: publishing }));
 // まず普通のfetchを試し、ダメなら実ブラウザ(Playwright)で取得する
 // ============================================================
 const NOTE_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
+
+// 「画像を追加」（見出し画像）コントロールのセレクタ。/publish と /probe で共有する。
+// 2026-08-21: noteのUI変更でbuttonからsvg[aria-label]に変わったため、タグ非限定を先頭に。
+// ※このリストを変えたら必ず /probe で実画面に対して検証すること
+const EYECATCH_ADD_SELECTORS = [
+  '[aria-label="画像を追加"]',
+  'svg[aria-label="画像を追加"]',
+  'button[aria-label="画像を追加"]',
+  '[aria-label*="見出し画像"]',
+  'button:has-text("画像を追加")',
+  'button:has-text("見出し画像")',
+  '[data-testid*="eyecatch"] button',
+];
 const searchUrl = (q, size) =>
   'https://note.com/api/v3/searches?context=note&q=' + encodeURIComponent(q) + '&size=' + size + '&sort=new';
 
@@ -398,15 +411,21 @@ app.post('/probe', async (req, res) => {
     const results = [];
     results.push(await scan(page, '1_editor_initial'));
 
-    // 「画像を追加」(svg)をクリックしてモーダルの中身を確認
+    // 本番(/publish)と同一のセレクタリストで探し、どれがヒットするか報告してからクリック
     try {
-      const add = page.locator('[aria-label="画像を追加"]').first();
-      if (await add.count() > 0) {
+      let matched = null, add = null;
+      for (const sel of EYECATCH_ADD_SELECTORS) {
+        const b = page.locator(sel).first();
+        if (await b.isVisible({ timeout: 1500 }).catch(() => false)) { matched = sel; add = b; break; }
+      }
+      if (add) {
         await add.click();
         await page.waitForTimeout(2000);
-        results.push(await scan(page, '2_after_click_add_image'));
+        const r2 = await scan(page, '2_after_click_add_image');
+        r2.matchedSelector = matched;
+        results.push(r2);
       } else {
-        results.push({ label: '2_no_add_image_element' });
+        results.push({ label: '2_no_add_image_element', triedSelectors: EYECATCH_ADD_SELECTORS });
       }
     } catch (e) { results.push({ label: '2_click_error', error: e.message.slice(0, 60) }); }
 
@@ -560,17 +579,9 @@ app.post('/publish', async (req, res) => {
         await page.evaluate(() => window.scrollTo(0, 0));
         await page.waitForTimeout(800);
 
-        // 「画像を追加」ボタンを複数パターンで探す
-        const addBtnCandidates = [
-          'button[aria-label="画像を追加"]',
-          'button[aria-label*="見出し画像"]',
-          'button[aria-label*="画像"]',
-          'button:has-text("画像を追加")',
-          'button:has-text("見出し画像")',
-          '[data-testid*="eyecatch"] button',
-        ];
+        // 「画像を追加」コントロールを共有リストで探す（診断/probeと同一リスト＝ズレ防止）
         let addImgBtn = null;
-        for (const sel of addBtnCandidates) {
+        for (const sel of EYECATCH_ADD_SELECTORS) {
           const b = page.locator(sel).first();
           if (await b.isVisible({ timeout: 1500 }).catch(() => false)) { addImgBtn = b; console.log('画像追加ボタン検出:', sel); break; }
         }
