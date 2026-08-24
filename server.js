@@ -596,6 +596,10 @@ app.post('/publish', async (req, res) => {
         await page.evaluate(() => window.scrollTo(0, 0));
         await page.waitForTimeout(800);
 
+        // 見出し画像UIは遅延レンダリングされる（2026-08-24実測：3秒では出ず9秒前後で出現）。
+        // isVisibleの即時判定ではなく「出現するまで最大20秒待つ」
+        await page.waitForSelector(EYECATCH_ADD_SELECTORS[0], { timeout: 20000 }).catch(() => {});
+
         // 「画像を追加」コントロールを共有リストで探す（診断/probeと同一リスト＝ズレ防止）
         let addImgBtn = null;
         for (const sel of EYECATCH_ADD_SELECTORS) {
