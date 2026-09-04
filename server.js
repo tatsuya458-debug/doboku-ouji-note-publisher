@@ -1,6 +1,6 @@
 const express = require('express');
 const { chromium } = require('playwright');
-const { writeFileSync, unlinkSync, existsSync } = require('fs');
+const { writeFileSync, unlinkSync, existsSync, statSync, createReadStream } = require('fs');
 const { join } = require('path');
 const { tmpdir } = require('os');
 const crypto = require('crypto');
@@ -17,6 +17,54 @@ app.use(express.json({ limit: '50mb' }));
 let publishing = false;
 
 app.get('/health', (req, res) => res.json({ ok: true, busy: publishing }));
+
+// ============================================================
+// リール動画の一時ホスティング（2026-09-04追加）
+// Instagram Content Publishing APIは「動画ファイルの添付」ではなく
+// 「公開URLを渡す」方式なので、投稿の間だけ動画を配信する口を用意する。
+//   POST /reel-upload {video: base64, key: "任意のID"} → 公開URLを返す
+//   GET  /reel/<key>.mp4                              → 動画本体
+// メモリを圧迫しないよう /tmp に置き、6時間で自動削除する。
+// ============================================================
+const REEL_TTL_MS = 6 * 60 * 60 * 1000;
+const reelFiles = new Map(); // key -> { path, expires }
+
+function sweepReels_() {
+  const now = Date.now();
+  for (const [k, v] of reelFiles) {
+    if (v.expires < now) {
+      try { unlinkSync(v.path); } catch {}
+      reelFiles.delete(k);
+    }
+  }
+}
+setInterval(sweepReels_, 30 * 60 * 1000).unref();
+
+app.post('/reel-upload', (req, res) => {
+  try {
+    const { video, key } = req.body || {};
+    if (!video) return res.status(400).json({ success: false, error: 'video (base64) required' });
+    const id = String(key || crypto.randomBytes(6).toString('hex')).replace(/[^A-Za-z0-9_-]/g, '');
+    const dest = join(tmpdir(), `reel_${id}.mp4`);
+    const b64 = String(video).replace(/^data:video\/\w+;base64,/, '');
+    writeFileSync(dest, Buffer.from(b64, 'base64'));
+    reelFiles.set(id, { path: dest, expires: Date.now() + REEL_TTL_MS });
+    const base = process.env.PUBLIC_BASE_URL || 'https://doboku-ouji-note-publisher.onrender.com';
+    console.log(`reel-upload: ${id} (${(statSync(dest).size / 1024 / 1024).toFixed(2)} MB)`);
+    res.json({ success: true, url: `${base}/reel/${id}.mp4`, expiresInHours: 6 });
+  } catch (e) {
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+app.get('/reel/:name', (req, res) => {
+  const id = String(req.params.name || '').replace(/\.mp4$/, '').replace(/[^A-Za-z0-9_-]/g, '');
+  const rec = reelFiles.get(id);
+  if (!rec || !existsSync(rec.path)) return res.status(404).send('not found');
+  res.setHeader('Content-Type', 'video/mp4');
+  res.setHeader('Content-Length', statSync(rec.path).size);
+  createReadStream(rec.path).pipe(res);
+});
 
 // ============================================================
 // GET /candidates?q=kw1,kw2,kw3&size=10
