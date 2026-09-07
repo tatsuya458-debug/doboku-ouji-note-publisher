@@ -487,7 +487,8 @@ app.post('/probe', async (req, res) => {
       const pubBtn2 = page.locator('button:has-text("公開に進む")').first();
       if (await pubBtn2.isVisible({ timeout: 3000 }).catch(() => false)) {
         await pubBtn2.click();
-        await page.waitForTimeout(4000);
+        await page.waitForURL(u => String(u).includes('/publish'), { timeout: 20000 }).catch(() => {});
+        await page.waitForTimeout(10000); // 販売設定画面は遅延レンダリング
         const paid = await page.evaluate(() => {
           const out = { url: location.href, priceRelated: [], inputs: [], buttons: [] };
           document.querySelectorAll('*').forEach(el => {
