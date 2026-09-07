@@ -476,6 +476,43 @@ app.post('/probe', async (req, res) => {
     } catch (e) { late.htmlError = e.message.slice(0, 60); }
     results.push(late);
 
+    // 有料設定のUI調査（2026-09-07追加）: 本文を入れて「公開に進む」を押し、販売設定画面を見る
+    try {
+      const titleSel2 = 'textarea[placeholder*="タイトル"], [data-placeholder*="タイトル"]';
+      await page.fill(titleSel2, 'probe有料テスト').catch(() => {});
+      await page.waitForTimeout(600);
+      const body2 = page.locator('[contenteditable="true"]').last();
+      if (await body2.count() > 0) { await body2.click(); await page.keyboard.type('本文テスト1行目'); }
+      await page.waitForTimeout(800);
+      const pubBtn2 = page.locator('button:has-text("公開に進む")').first();
+      if (await pubBtn2.isVisible({ timeout: 3000 }).catch(() => false)) {
+        await pubBtn2.click();
+        await page.waitForTimeout(4000);
+        const paid = await page.evaluate(() => {
+          const out = { url: location.href, priceRelated: [], inputs: [], buttons: [] };
+          document.querySelectorAll('*').forEach(el => {
+            const aria = (el.getAttribute && el.getAttribute('aria-label')) || '';
+            const text = el.childElementCount === 0 ? (el.textContent || '').trim() : '';
+            if (/有料|価格|販売|円|無料|ライン|エリア/.test(aria + ' ' + text) && (aria + text).length < 40) {
+              const d = el.tagName + ' "' + (aria || text).slice(0, 30) + '"';
+              if (!out.priceRelated.includes(d) && out.priceRelated.length < 25) out.priceRelated.push(d);
+            }
+          });
+          document.querySelectorAll('input,select,textarea').forEach(el => {
+            out.inputs.push(el.tagName + ' type=' + (el.type || '') + ' name=' + (el.name || '') + ' ph="' + (el.placeholder || '').slice(0, 20) + '"');
+          });
+          document.querySelectorAll('button,[role="button"]').forEach(el => {
+            const t = ((el.getAttribute('aria-label') || '') + (el.textContent || '')).trim().slice(0, 28);
+            if (t && out.buttons.length < 30) out.buttons.push(t);
+          });
+          return out;
+        });
+        results.push({ label: '4_publish_settings', ...paid });
+      } else {
+        results.push({ label: '4_no_publish_button' });
+      }
+    } catch (e) { results.push({ label: '4_error', error: e.message.slice(0, 80) }); }
+
     // 本番(/publish)と同一のセレクタリストで探し、どれがヒットするか報告してからクリック
     try {
       let matched = null, add = null;
