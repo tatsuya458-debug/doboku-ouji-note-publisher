@@ -19,6 +19,16 @@ let publishing = false;
 app.get('/health', (req, res) => res.json({ ok: true, busy: publishing }));
 
 // ============================================================
+// 直近の /publish の結果を保持して後から取得できるようにする（2026-09-08追加）
+// 3万字の投稿は5分以上かかり、その間にクライアント側の接続が切れて
+// 結果を受け取れないことがあるため。GET /last-result で確認できる。
+// ============================================================
+let lastPublishResult = null;
+const saveResult_ = (obj) => { lastPublishResult = { ...obj, finishedAt: new Date().toISOString() }; return obj; };
+app.get('/last-result', (req, res) =>
+  res.json(lastPublishResult || { message: 'まだ実行結果がありません' }));
+
+// ============================================================
 // リール動画の一時ホスティング（2026-09-04追加）
 // Instagram Content Publishing APIは「動画ファイルの添付」ではなく
 // 「公開URLを渡す」方式なので、投稿の間だけ動画を配信する口を用意する。
@@ -676,14 +686,14 @@ app.post('/publish', async (req, res) => {
       const lg = await noteLogin_(page);
       if (!lg.success) {
         await browser.close();
-        return res.json({ success: false, error: 'Cookie切れ（ログインセッション期限切れ）。setNoteCookie()で更新してください' });
+        return res.json(saveResult_({ success: false, error: 'Cookie切れ（ログインセッション期限切れ）。setNoteCookie()で更新してください' }));
       }
       refreshedCookie = lg.cookie; // 成功したらGASに返して保存させる
       await page.goto('https://note.com/notes/new', { waitUntil: 'networkidle', timeout: 30000 });
       await page.waitForTimeout(3000);
       if (page.url().includes('/login')) {
         await browser.close();
-        return res.json({ success: false, error: '自動ログイン後もエディターを開けませんでした' });
+        return res.json(saveResult_({ success: false, error: '自動ログイン後もエディターを開けませんでした' }));
       }
     }
 
@@ -959,7 +969,7 @@ app.post('/publish', async (req, res) => {
         [...document.querySelectorAll('button')].map(b => b.textContent?.trim()).filter(Boolean).join(', ')
       );
       await browser.close();
-      return res.json({ success: false, error: '「公開に進む」ボタンが見つかりません。利用可能なボタン: ' + availableButtons });
+      return res.json(saveResult_({ success: false, error: '「公開に進む」ボタンが見つかりません。利用可能なボタン: ' + availableButtons }));
     }
     await page.waitForTimeout(3500);
 
@@ -1088,11 +1098,11 @@ app.post('/publish', async (req, res) => {
       await browser.close();
       if (thumbPath && existsSync(thumbPath)) { try { unlinkSync(thumbPath); } catch {} }
       console.log('dryRun: 投稿せずに終了');
-      return res.json({
+      return res.json(saveResult_({
         success: true, dryRun: true, draftUrl,
         message: '下書きを作成し、設定画面まで進めました（投稿はしていません）',
         thumbnailSet, thumbDiag, paidResult, newCookie: refreshedCookie,
-      });
+      }));
     }
 
     console.log('投稿実行中...');
@@ -1151,7 +1161,7 @@ app.post('/publish', async (req, res) => {
         [...document.querySelectorAll('button')].map(b => b.textContent?.trim()).filter(Boolean).join(', ')
       );
       await browser.close();
-      return res.json({ success: false, error: '投稿ボタンが見つかりません。利用可能なボタン: ' + availableButtons });
+      return res.json(saveResult_({ success: false, error: '投稿ボタンが見つかりません。利用可能なボタン: ' + availableButtons }));
     }
 
     // ============================================================
@@ -1193,15 +1203,15 @@ app.post('/publish', async (req, res) => {
     if (thumbPath && existsSync(thumbPath)) { try { unlinkSync(thumbPath); } catch {} }
 
     if (noteUrl) {
-      return res.json({ success: true, url: noteUrl, newCookie: refreshedCookie, thumbnailSet, thumbDiag, paidResult });
+      return res.json(saveResult_({ success: true, url: noteUrl, newCookie: refreshedCookie, thumbnailSet, thumbDiag, paidResult }));
     }
-    return res.json({ success: false, error: '投稿完了したがURL取得失敗', newCookie: refreshedCookie, thumbnailSet, thumbDiag });
+    return res.json(saveResult_({ success: false, error: '投稿完了したがURL取得失敗', newCookie: refreshedCookie, thumbnailSet, thumbDiag }));
 
   } catch (e) {
     if (browser) await browser.close().catch(() => {});
     if (thumbPath && existsSync(thumbPath)) { try { unlinkSync(thumbPath); } catch {} }
     console.error('エラー:', e.message);
-    return res.json({ success: false, error: e.message });
+    return res.json(saveResult_({ success: false, error: e.message }));
   } finally {
     // 成功・失敗・例外いずれの場合もロックを必ず解放する
     publishing = false;
