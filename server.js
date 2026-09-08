@@ -592,7 +592,9 @@ app.post('/publish', async (req, res) => {
     cookie,
     tags = [],
     thumbnail = null,
-    magazine = ''
+    magazine = '',
+    price = 0,       // 有料記事の価格。0または未指定なら無料記事（2026-09-08追加）
+    dryRun = false   // trueなら「投稿する」を押さず、設定画面の状態を返して止める
   } = req.body;
 
   if (!title || !body || !cookie) {
@@ -608,6 +610,9 @@ app.post('/publish', async (req, res) => {
 
   // Cookie切れで自動ログインした場合、新しいCookieをGASに返して保存させる
   let refreshedCookie = null;
+  // 有料記事用（2026-09-08追加）
+  let paidAreaInserted = false;
+  let paidResult = null;
 
   // サムネイルを一時ファイルに保存
   let thumbPath = null;
@@ -847,6 +852,17 @@ app.post('/publish', async (req, res) => {
         inQuote = false;
       }
 
+      // 有料エリアの区切り（2026-09-08追加）
+      // 本文中に <<<PAID>>> の行があれば、そこに note の「有料エリア指定」を挿入する。
+      // これ以降が購入者だけに見える範囲になる。
+      if (t === '<<<PAID>>>') {
+        const ok = await clickPlusMenuItem(page, '有料エリア指定');
+        console.log('有料エリア指定の挿入:', ok ? '成功' : '失敗');
+        paidAreaInserted = ok;
+        await page.waitForTimeout(1200);
+        continue;
+      }
+
       // 空行・区切り線
       if (t === '' || t === '---') {
         await page.keyboard.press('Enter');
@@ -979,6 +995,64 @@ app.post('/publish', async (req, res) => {
     }
 
     // ============================================================
+    // Step 7b: 有料設定（2026-09-08追加）
+    // 販売設定画面の input[name="is_paid"] は視覚的に隠れているため、
+    // DOM側でラベルをクリックする。価格欄は「有料」選択後に出現する。
+    // ============================================================
+    if (price && Number(price) > 0) {
+      console.log('有料設定中: ¥' + price);
+      try {
+        const radio = await page.evaluate(() => {
+          const rs = [...document.querySelectorAll('input[name="is_paid"]')];
+          if (rs.length < 2) return { ok: false, reason: 'ラジオが見つからない(' + rs.length + ')' };
+          const target = rs[rs.length - 1]; // 「有料」は後ろ側
+          target.scrollIntoView({ block: 'center' });
+          const lbl = target.closest('label') || document.querySelector('label[for="' + target.id + '"]');
+          (lbl || target).click();
+          return { ok: true, checked: target.checked, via: lbl ? 'label' : 'input' };
+        });
+        console.log('有料ラジオ:', JSON.stringify(radio));
+        await page.waitForTimeout(4000);
+
+        // 価格入力欄を探す（文言ゆらぎに対応）
+        const priceSelectors = [
+          'input[name*="price"]', 'input[id*="price"]',
+          'input[placeholder*="価格"]', 'input[placeholder*="円"]',
+          'input[type="number"]',
+        ];
+        let priceSet = false;
+        for (const sel of priceSelectors) {
+          const el = page.locator(sel).first();
+          if (await el.isVisible({ timeout: 2000 }).catch(() => false)) {
+            await el.click({ force: true }).catch(() => {});
+            await el.fill(String(price)).catch(async () => {
+              await page.keyboard.type(String(price));
+            });
+            priceSet = true;
+            console.log('価格を入力:', sel);
+            break;
+          }
+        }
+        if (!priceSet) {
+          // 診断：画面にある入力欄を記録して次の修正に使う
+          const diag = await page.evaluate(() =>
+            [...document.querySelectorAll('input')].map(i =>
+              i.tagName + ' type=' + i.type + ' name=' + i.name + ' id=' + i.id + ' ph=' + (i.placeholder || '')
+            ).slice(0, 20).join(' | ')
+          );
+          console.log('価格欄が見つかりません。入力欄一覧:', diag);
+          paidResult = { paidAreaInserted, radio, priceSet: false, diag };
+        } else {
+          await page.waitForTimeout(1500);
+          paidResult = { paidAreaInserted, radio, priceSet: true };
+        }
+      } catch (e) {
+        console.log('有料設定エラー:', e.message.slice(0, 100));
+        paidResult = { paidAreaInserted, error: e.message.slice(0, 100) };
+      }
+    }
+
+    // ============================================================
     // Step 8: マガジン追加
     // ============================================================
     if (magazine) {
@@ -1007,6 +1081,20 @@ app.post('/publish', async (req, res) => {
     // ============================================================
     // Step 9: 投稿実行
     // ============================================================
+    // dryRun: 投稿ボタンを押さずにここで止める（有料設定の検証用・2026-09-08追加）
+    // 下書きは残るので、note側で内容を目視してから手動で公開できる。
+    if (dryRun) {
+      const draftUrl = page.url();
+      await browser.close();
+      if (thumbPath && existsSync(thumbPath)) { try { unlinkSync(thumbPath); } catch {} }
+      console.log('dryRun: 投稿せずに終了');
+      return res.json({
+        success: true, dryRun: true, draftUrl,
+        message: '下書きを作成し、設定画面まで進めました（投稿はしていません）',
+        thumbnailSet, thumbDiag, paidResult, newCookie: refreshedCookie,
+      });
+    }
+
     console.log('投稿実行中...');
     await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
     await page.waitForTimeout(800);
@@ -1105,7 +1193,7 @@ app.post('/publish', async (req, res) => {
     if (thumbPath && existsSync(thumbPath)) { try { unlinkSync(thumbPath); } catch {} }
 
     if (noteUrl) {
-      return res.json({ success: true, url: noteUrl, newCookie: refreshedCookie, thumbnailSet, thumbDiag });
+      return res.json({ success: true, url: noteUrl, newCookie: refreshedCookie, thumbnailSet, thumbDiag, paidResult });
     }
     return res.json({ success: false, error: '投稿完了したがURL取得失敗', newCookie: refreshedCookie, thumbnailSet, thumbDiag });
 
