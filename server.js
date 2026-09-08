@@ -419,6 +419,39 @@ app.post('/login', async (req, res) => {
 });
 
 // ============================================================
+// POST /drafts … note の下書き一覧を取得する（2026-09-08追加・dryRunの確認用）
+// ============================================================
+app.post('/drafts', async (req, res) => {
+  const cookie = String((req.body || {}).cookie || '');
+  if (!cookie) return res.status(400).json({ success: false, error: 'cookie required' });
+  if (publishing) return res.status(429).json({ success: false, busy: true });
+  publishing = true;
+  let browser;
+  try {
+    browser = await chromium.launch({ args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu', '--single-process'] });
+    const context = await browser.newContext({ userAgent: NOTE_UA, viewport: { width: 1280, height: 900 } });
+    const parsed = cookie.split('; ').map(c => { const i = c.indexOf('='); return { name: c.substring(0, i).trim(), value: c.substring(i + 1).trim(), path: '/' }; }).filter(c => c.name && c.value);
+    await context.addCookies([...parsed.map(c => ({ ...c, domain: '.note.com' })), ...parsed.map(c => ({ ...c, domain: 'editor.note.com' }))]);
+    const page = await context.newPage();
+    await page.goto('https://note.com/notes', { waitUntil: 'networkidle', timeout: 40000 });
+    await page.waitForTimeout(8000);
+    const info = await page.evaluate(() => {
+      const rows = [];
+      document.querySelectorAll('a[href*="/edit"], a[href*="/notes/n"]').forEach(a => {
+        const t = (a.textContent || '').trim().replace(/\s+/g, ' ').slice(0, 60);
+        if (t && rows.length < 20) rows.push(t + ' => ' + a.getAttribute('href'));
+      });
+      return { url: location.href, rows, bodyText: (document.body.innerText || '').replace(/\s+/g, ' ').slice(0, 1000) };
+    });
+    await browser.close();
+    res.json({ success: true, ...info });
+  } catch (e) {
+    if (browser) await browser.close().catch(() => {});
+    res.status(500).json({ success: false, error: e.message });
+  } finally { publishing = false; }
+});
+
+// ============================================================
 // POST /probe … note編集画面のUI構造を調査する診断用（投稿はしない）
 // 2026-08-21: UI変更で見出し画像の設定場所が消えたため、実画面から探すために追加
 // ============================================================
