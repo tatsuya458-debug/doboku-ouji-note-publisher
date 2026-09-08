@@ -491,12 +491,20 @@ app.post('/probe', async (req, res) => {
         await page.waitForTimeout(10000); // 販売設定画面は遅延レンダリング
         // 「有料」ラジオを選んで、出現する価格入力欄を調べる
         try {
-          const paidRadio = page.locator('input[name="is_paid"]').last();
-          if (await paidRadio.count() > 0) {
-            await paidRadio.check({ force: true }).catch(async () => { await paidRadio.click({ force: true }); });
-            await page.waitForTimeout(5000);
-          }
-        } catch (e) { results.push({ label: '4b_radio_error', error: e.message.slice(0, 60) }); }
+          // ラジオ自体は視覚的に隠れていることが多いので、DOM側で直接クリックする
+          const clicked = await page.evaluate(() => {
+            const rs = [...document.querySelectorAll('input[name="is_paid"]')];
+            if (rs.length < 2) return 'radio not found: ' + rs.length;
+            const target = rs[rs.length - 1]; // 「有料」は後ろ側
+            target.scrollIntoView({ block: 'center' });
+            // ラベル経由のほうが React に伝わりやすい
+            const lbl = target.closest('label') || document.querySelector('label[for="' + target.id + '"]');
+            (lbl || target).click();
+            return 'clicked via ' + (lbl ? 'label' : 'input') + ' / checked=' + target.checked;
+          });
+          results.push({ label: '4b_radio', result: clicked });
+          await page.waitForTimeout(6000);
+        } catch (e) { results.push({ label: '4b_radio_error', error: e.message.slice(0, 80) }); }
 
         const paid = await page.evaluate(() => {
           const out = { url: location.href, priceRelated: [], inputs: [], buttons: [] };
