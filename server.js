@@ -442,34 +442,28 @@ app.post('/drafts', async (req, res) => {
     await page.goto('https://note.com/notes', { waitUntil: 'domcontentloaded', timeout: 40000 });
     await page.waitForTimeout(9000);
     // SPAのため一覧はHTMLに出ない。同一オリジンでnote内部APIを叩く（WAF回避もかねる）
-    const info = await page.evaluate(async () => {
-      const candidates = [
-        '/api/v1/our/contents?kind=note&status=draft&page=1',
-        '/api/v2/our/contents?kind=note&status=draft&page=1',
-        '/api/v1/our/notes?status=draft&page=1',
-      ];
-      const rows = [];
-      let usedApi = null, raw = null;
-      for (const url of candidates) {
-        try {
-          const r = await fetch(url, { credentials: 'include' });
-          if (!r.ok) { raw = url + ' -> ' + r.status; continue; }
-          const j = await r.json();
-          const list = (j && j.data && (j.data.contents || j.data.notes)) || (j && j.contents) || [];
-          if (!Array.isArray(list) || !list.length) { raw = JSON.stringify(j).slice(0, 400); continue; }
-          usedApi = url;
-          list.slice(0, 15).forEach(n => rows.push({
-            name: n.key || n.id,
-            title: n.name || n.title || '',
-            status: n.status,
-            price: n.price,
-            editUrl: 'https://editor.note.com/notes/' + (n.key || n.id) + '/edit/',
-          }));
-          break;
-        } catch (e) { raw = 'err:' + e.message; }
+    // 2026-09-10: 実際にnote本体が使っているAPIを実測して判明した正式エンドポイント
+    const apiPath = String((req.body || {}).api || '/api/v2/note_list/contents?limit=20&page=1');
+    const rawOnly = !!(req.body || {}).raw;
+    const info = await page.evaluate(async (args) => {
+      const { apiPath, rawOnly } = args;
+      try {
+        const r = await fetch(apiPath, { credentials: 'include' });
+        const j = await r.json();
+        if (rawOnly) return { url: location.href, usedApi: apiPath, status: r.status, raw: JSON.stringify(j).slice(0, 6000), rows: [] };
+        const list = (j && j.data && (j.data.contents || j.data.notes || j.data.items)) || (j && j.contents) || [];
+        const rows = (Array.isArray(list) ? list : []).slice(0, 20).map(n => ({
+          key: n.key || n.id,
+          title: n.name || n.title || '',
+          status: n.status,
+          price: n.price,
+          editUrl: 'https://editor.note.com/notes/' + (n.key || n.id) + '/edit/',
+        }));
+        return { url: location.href, usedApi: apiPath, status: r.status, rows, raw: rows.length ? null : JSON.stringify(j).slice(0, 1500) };
+      } catch (e) {
+        return { url: location.href, usedApi: apiPath, rows: [], raw: 'err:' + e.message };
       }
-      return { url: location.href, usedApi, rows, raw };
-    });
+    }, { apiPath, rawOnly });
     await browser.close();
     res.json({ success: true, ...info, apiCalls });
   } catch (e) {
