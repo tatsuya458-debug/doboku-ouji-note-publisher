@@ -497,6 +497,83 @@ app.post('/drafts', async (req, res) => {
 });
 
 // ============================================================
+// POST /set-paid … 既存の下書きに「有料エリア指定」の区切りだけを入れる（投稿はしない）
+// 2026-09-10: 3万字の本文を入れ直さずに有料設定をやり直せるようにするため追加
+// Body: { cookie, key, anchor, dryRun? }  anchor = 有料エリアの開始にしたい行の文字列
+// ============================================================
+app.post('/set-paid', async (req, res) => {
+  const cookie = String((req.body || {}).cookie || '');
+  const key = String((req.body || {}).key || '');
+  const anchor = String((req.body || {}).anchor || '');
+  if (!cookie || !key || !anchor) return res.status(400).json({ success: false, error: 'cookie, key, anchor required' });
+  if (publishing) return res.status(429).json({ success: false, busy: true });
+  publishing = true;
+  let browser;
+  try {
+    browser = await chromium.launch({ args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu', '--single-process'] });
+    const context = await browser.newContext({ userAgent: NOTE_UA, viewport: { width: 1280, height: 900 } });
+    const parsed = cookie.split('; ').map(c => { const i = c.indexOf('='); return { name: c.substring(0, i).trim(), value: c.substring(i + 1).trim(), path: '/' }; }).filter(c => c.name && c.value);
+    await context.addCookies([...parsed.map(c => ({ ...c, domain: '.note.com' })), ...parsed.map(c => ({ ...c, domain: 'editor.note.com' }))]);
+    const page = await context.newPage();
+    await page.goto('https://editor.note.com/notes/' + key + '/edit/', { waitUntil: 'domcontentloaded', timeout: 60000 });
+    await page.waitForTimeout(15000);
+    if (page.url().includes('/login')) { await browser.close(); publishing = false; return res.json({ success: false, error: 'cookie expired' }); }
+
+    // 1. 有料エリアの開始位置にキャレットを置く
+    const placed = await page.evaluate((a) => {
+      const nodes = [...document.querySelectorAll('h1,h2,h3,p')];
+      const el = nodes.find(n => (n.textContent || '').indexOf(a) >= 0);
+      if (!el) return { ok: false, reason: 'anchor not found', sample: nodes.slice(0, 8).map(n => (n.textContent || '').slice(0, 30)) };
+      el.scrollIntoView({ block: 'center' });
+      const sel = window.getSelection(); const range = document.createRange();
+      range.setStart(el, 0); range.collapse(true);
+      sel.removeAllRanges(); sel.addRange(range);
+      el.focus && el.focus();
+      return { ok: true, tag: el.tagName, text: (el.textContent || '').slice(0, 40) };
+    }, anchor);
+    if (!placed.ok) { await browser.close(); publishing = false; return res.json({ success: false, step: 'placeCaret', placed }); }
+    await page.waitForTimeout(1200);
+
+    // 2. ＋メニューを開いて中身を全部記録してから「有料エリア指定」を押す
+    let menuItems = [];
+    let clicked = false;
+    const plusBtn = page.locator('button[aria-label="メニューを開く"]').first();
+    const plusVisible = await plusBtn.isVisible({ timeout: 5000 }).catch(() => false);
+    if (plusVisible) {
+      await plusBtn.click({ force: true });
+      await page.waitForTimeout(2000);
+      const r = await page.evaluate(() => {
+        const items = [...document.querySelectorAll('button')].filter(b => b.offsetParent !== null).map(b => (b.textContent || '').trim()).filter(Boolean);
+        const btn = [...document.querySelectorAll('button')].find(b => (b.textContent || '').trim() === '有料エリア指定' && b.offsetParent !== null);
+        if (btn) { btn.click(); return { items: items.slice(0, 40), clicked: true }; }
+        return { items: items.slice(0, 40), clicked: false };
+      });
+      menuItems = r.items; clicked = r.clicked;
+    }
+    await page.waitForTimeout(4000);
+
+    // 3. 自動保存を待ってから、APIで separator が入ったか実測する
+    const verify = await page.evaluate(async (k) => {
+      try {
+        const r = await fetch('https://note.com/api/v2/note_list/contents?limit=20&page=1', { credentials: 'include' });
+        const j = await r.json();
+        const list = (j && j.data && j.data.notes) || [];
+        const hit = list.find(n => n.key === k);
+        if (!hit) return { found: false };
+        const d = hit.noteDraft || {};
+        return { found: true, separator: d.separator || hit.separator || null, bodyLen: String(d.body || '').length };
+      } catch (e) { return { found: false, err: e.message }; }
+    }, key);
+
+    await browser.close();
+    res.json(saveResult_({ success: clicked && !!verify.separator, placed, plusVisible, clicked, menuItems, verify, editUrl: 'https://editor.note.com/notes/' + key + '/edit/' }));
+  } catch (e) {
+    if (browser) await browser.close().catch(() => {});
+    res.status(500).json({ success: false, error: e.message });
+  } finally { publishing = false; }
+});
+
+// ============================================================
 // POST /probe … note編集画面のUI構造を調査する診断用（投稿はしない）
 // 2026-08-21: UI変更で見出し画像の設定場所が消えたため、実画面から探すために追加
 // ============================================================
