@@ -433,8 +433,14 @@ app.post('/drafts', async (req, res) => {
     const parsed = cookie.split('; ').map(c => { const i = c.indexOf('='); return { name: c.substring(0, i).trim(), value: c.substring(i + 1).trim(), path: '/' }; }).filter(c => c.name && c.value);
     await context.addCookies([...parsed.map(c => ({ ...c, domain: '.note.com' })), ...parsed.map(c => ({ ...c, domain: 'editor.note.com' }))]);
     const page = await context.newPage();
+    // note本体がどのAPIで一覧を取っているかを実測する（推測でURLを当てない）
+    const apiCalls = [];
+    page.on('response', r => {
+      const u = r.url();
+      if (u.indexOf('/api/') >= 0 && apiCalls.length < 40) apiCalls.push(r.status() + ' ' + u.slice(0, 160));
+    });
     await page.goto('https://note.com/notes', { waitUntil: 'domcontentloaded', timeout: 40000 });
-    await page.waitForTimeout(4000);
+    await page.waitForTimeout(9000);
     // SPAのため一覧はHTMLに出ない。同一オリジンでnote内部APIを叩く（WAF回避もかねる）
     const info = await page.evaluate(async () => {
       const candidates = [
@@ -447,7 +453,7 @@ app.post('/drafts', async (req, res) => {
       for (const url of candidates) {
         try {
           const r = await fetch(url, { credentials: 'include' });
-          if (!r.ok) continue;
+          if (!r.ok) { raw = url + ' -> ' + r.status; continue; }
           const j = await r.json();
           const list = (j && j.data && (j.data.contents || j.data.notes)) || (j && j.contents) || [];
           if (!Array.isArray(list) || !list.length) { raw = JSON.stringify(j).slice(0, 400); continue; }
@@ -465,7 +471,7 @@ app.post('/drafts', async (req, res) => {
       return { url: location.href, usedApi, rows, raw };
     });
     await browser.close();
-    res.json({ success: true, ...info });
+    res.json({ success: true, ...info, apiCalls });
   } catch (e) {
     if (browser) await browser.close().catch(() => {});
     res.status(500).json({ success: false, error: e.message });
