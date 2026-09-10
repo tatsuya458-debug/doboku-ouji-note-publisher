@@ -445,6 +445,7 @@ app.post('/drafts', async (req, res) => {
     // 2026-09-10: 実際にnote本体が使っているAPIを実測して判明した正式エンドポイント
     const apiPath = String((req.body || {}).api || '/api/v2/note_list/contents?limit=20&page=1');
     const rawOnly = !!(req.body || {}).raw;
+    const onlyDraft = !!(req.body || {}).onlyDraft;
     const info = await page.evaluate(async (args) => {
       const { apiPath, rawOnly } = args;
       try {
@@ -452,18 +453,26 @@ app.post('/drafts', async (req, res) => {
         const j = await r.json();
         if (rawOnly) return { url: location.href, usedApi: apiPath, status: r.status, raw: JSON.stringify(j).slice(0, 6000), rows: [] };
         const list = (j && j.data && (j.data.contents || j.data.notes || j.data.items)) || (j && j.contents) || [];
-        const rows = (Array.isArray(list) ? list : []).slice(0, 20).map(n => ({
-          key: n.key || n.id,
-          title: n.name || n.title || '',
-          status: n.status,
-          price: n.price,
-          editUrl: 'https://editor.note.com/notes/' + (n.key || n.id) + '/edit/',
-        }));
+        // 下書きは name/body/price が noteDraft 側に入る。separator が有料エリアの区切り位置
+        const rows = (Array.isArray(list) ? list : []).slice(0, 20).map(n => {
+          const d = n.noteDraft || {};
+          const body = String(d.body || n.body || '');
+          const sep = String(d.separator || n.separator || '');
+          return {
+            key: n.key || n.id,
+            title: n.name || d.name || '',
+            status: n.status,
+            price: (n.price != null && n.price !== 0) ? n.price : (d.price != null ? d.price : n.price),
+            bodyLen: body.length,
+            separator: sep ? sep.slice(0, 120) : null,
+            editUrl: 'https://editor.note.com/notes/' + (n.key || n.id) + '/edit/',
+          };
+        }).filter(r => !args.onlyDraft || r.status === 'draft');
         return { url: location.href, usedApi: apiPath, status: r.status, rows, raw: rows.length ? null : JSON.stringify(j).slice(0, 1500) };
       } catch (e) {
         return { url: location.href, usedApi: apiPath, rows: [], raw: 'err:' + e.message };
       }
-    }, { apiPath, rawOnly });
+    }, { apiPath, rawOnly, onlyDraft });
     await browser.close();
     res.json({ success: true, ...info, apiCalls });
   } catch (e) {
