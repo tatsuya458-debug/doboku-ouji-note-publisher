@@ -468,11 +468,26 @@ app.post('/drafts', async (req, res) => {
             editUrl: 'https://editor.note.com/notes/' + (n.key || n.id) + '/edit/',
           };
         }).filter(r => !args.onlyDraft || r.status === 'draft');
-        return { url: location.href, usedApi: apiPath, status: r.status, rows, raw: rows.length ? null : JSON.stringify(j).slice(0, 1500) };
+        // key指定があれば、その記事の本文から有料エリアの区切りを探して前後を返す
+        let inspect = null;
+        if (args.key) {
+          const hit = (Array.isArray(list) ? list : []).find(n => (n.key || n.id) === args.key);
+          if (hit) {
+            const body = String((hit.noteDraft || {}).body || hit.body || '');
+            const marks = [];
+            const re = /(有料|paywall|paid|separator|<hr[^>]*>|限定)/gi;
+            let m, guard = 0;
+            while ((m = re.exec(body)) && guard++ < 25) {
+              marks.push({ at: m.index, ctx: body.slice(Math.max(0, m.index - 90), m.index + 90) });
+            }
+            inspect = { key: args.key, bodyLen: body.length, head: body.slice(0, 200), tail: body.slice(-200), marks };
+          }
+        }
+        return { url: location.href, usedApi: apiPath, status: r.status, rows, inspect, raw: rows.length ? null : JSON.stringify(j).slice(0, 1500) };
       } catch (e) {
         return { url: location.href, usedApi: apiPath, rows: [], raw: 'err:' + e.message };
       }
-    }, { apiPath, rawOnly, onlyDraft });
+    }, { apiPath, rawOnly, onlyDraft, key: String((req.body || {}).key || '') });
     await browser.close();
     res.json({ success: true, ...info, apiCalls });
   } catch (e) {
