@@ -433,15 +433,36 @@ app.post('/drafts', async (req, res) => {
     const parsed = cookie.split('; ').map(c => { const i = c.indexOf('='); return { name: c.substring(0, i).trim(), value: c.substring(i + 1).trim(), path: '/' }; }).filter(c => c.name && c.value);
     await context.addCookies([...parsed.map(c => ({ ...c, domain: '.note.com' })), ...parsed.map(c => ({ ...c, domain: 'editor.note.com' }))]);
     const page = await context.newPage();
-    await page.goto('https://note.com/notes', { waitUntil: 'networkidle', timeout: 40000 });
-    await page.waitForTimeout(8000);
-    const info = await page.evaluate(() => {
+    await page.goto('https://note.com/notes', { waitUntil: 'domcontentloaded', timeout: 40000 });
+    await page.waitForTimeout(4000);
+    // SPAのため一覧はHTMLに出ない。同一オリジンでnote内部APIを叩く（WAF回避もかねる）
+    const info = await page.evaluate(async () => {
+      const candidates = [
+        '/api/v1/our/contents?kind=note&status=draft&page=1',
+        '/api/v2/our/contents?kind=note&status=draft&page=1',
+        '/api/v1/our/notes?status=draft&page=1',
+      ];
       const rows = [];
-      document.querySelectorAll('a[href*="/edit"], a[href*="/notes/n"]').forEach(a => {
-        const t = (a.textContent || '').trim().replace(/\s+/g, ' ').slice(0, 60);
-        if (t && rows.length < 20) rows.push(t + ' => ' + a.getAttribute('href'));
-      });
-      return { url: location.href, rows, bodyText: (document.body.innerText || '').replace(/\s+/g, ' ').slice(0, 1000) };
+      let usedApi = null, raw = null;
+      for (const url of candidates) {
+        try {
+          const r = await fetch(url, { credentials: 'include' });
+          if (!r.ok) continue;
+          const j = await r.json();
+          const list = (j && j.data && (j.data.contents || j.data.notes)) || (j && j.contents) || [];
+          if (!Array.isArray(list) || !list.length) { raw = JSON.stringify(j).slice(0, 400); continue; }
+          usedApi = url;
+          list.slice(0, 15).forEach(n => rows.push({
+            name: n.key || n.id,
+            title: n.name || n.title || '',
+            status: n.status,
+            price: n.price,
+            editUrl: 'https://editor.note.com/notes/' + (n.key || n.id) + '/edit/',
+          }));
+          break;
+        } catch (e) { raw = 'err:' + e.message; }
+      }
+      return { url: location.href, usedApi, rows, raw };
     });
     await browser.close();
     res.json({ success: true, ...info });
