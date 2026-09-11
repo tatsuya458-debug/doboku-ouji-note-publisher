@@ -222,14 +222,18 @@ async function clickPlusMenuItem(page, itemText) {
   if (!await plusBtn.isVisible({ timeout: 3000 }).catch(() => false)) return false;
   await plusBtn.click({ force: true });
   await page.waitForTimeout(1500);
+  // 2026-09-10: noteがメニュー名を「箇条書き」→「箇条書きリスト」に変更しており
+  // 完全一致だけだと無言で空振りする。前方一致・部分一致まで段階的に許容する。
   const ok = await page.evaluate((text) => {
-    const btn = [...document.querySelectorAll('button')].find(
-      b => b.textContent?.trim() === text && b.offsetParent !== null
-    );
+    const vis = [...document.querySelectorAll('button')].filter(b => b.offsetParent !== null);
+    const btn = vis.find(b => b.textContent?.trim() === text)
+             || vis.find(b => b.textContent?.trim().startsWith(text))
+             || vis.find(b => b.textContent?.trim().indexOf(text) >= 0);
     if (btn) { btn.click(); return true; }
     return false;
   }, itemText);
   await page.waitForTimeout(300);
+  if (!ok) console.log('[警告] ＋メニュー項目が見つかりません:', itemText);
   return ok;
 }
 
@@ -998,23 +1002,51 @@ app.post('/publish', async (req, res) => {
       return !prevImg && !nextImg;
     });
 
-    let inList = false;
+    let inList = false;      // 箇条書きリスト
+    let inNumList = false;   // 番号付きリスト（2026-09-10追加）
     let inQuote = false;
+    let inCode = false;      // コードブロック（2026-09-10追加）
+    let tableHeader = null;  // 表の見出し行を一時保持（2026-09-10追加）
+
+    // 見出しや区切り線を入れる前に、開いているリスト・引用から抜ける
+    const closeBlocks = async () => {
+      if (inList || inNumList) {
+        await page.keyboard.press('Backspace');
+        await page.waitForTimeout(200);
+        inList = false; inNumList = false;
+      }
+      if (inQuote) {
+        await page.keyboard.press('Enter');
+        await page.waitForTimeout(200);
+        inQuote = false;
+      }
+    };
 
     for (const line of lines) {
       const t = line.trim();
 
-      // リストから出る
-      if (inList && !t.startsWith('- ') && !t.startsWith('* ')) {
-        await page.keyboard.press('Backspace');
-        await page.waitForTimeout(200);
-        inList = false;
-      }
-      // 引用から出る
-      if (inQuote && !t.startsWith('> ')) {
-        await page.keyboard.press('Enter');
-        await page.waitForTimeout(200);
-        inQuote = false;
+      if (!inCode) {
+        const isBullet = t.startsWith('- ') || t.startsWith('* ');
+        const isNum = /^\d+\. /.test(t);
+        const isTableRow = t.startsWith('|');   // 表は箇条書きに変換するのでリストを閉じない
+        // リストから出る
+        if (inList && !isBullet && !isTableRow) {
+          await page.keyboard.press('Backspace');
+          await page.waitForTimeout(200);
+          inList = false;
+        }
+        // 番号付きリストから出る
+        if (inNumList && !isNum) {
+          await page.keyboard.press('Backspace');
+          await page.waitForTimeout(200);
+          inNumList = false;
+        }
+        // 引用から出る
+        if (inQuote && !t.startsWith('> ')) {
+          await page.keyboard.press('Enter');
+          await page.waitForTimeout(200);
+          inQuote = false;
+        }
       }
 
       // 有料エリアの区切り（2026-09-08追加）
@@ -1028,14 +1060,68 @@ app.post('/publish', async (req, res) => {
         continue;
       }
 
-      // 空行・区切り線
-      if (t === '' || t === '---') {
+      // コードブロック（``` で開閉）。記録テンプレートや台本に使う
+      // 2026-09-10追加: 未対応だったため ``` が本文に文字のまま入っていた
+      if (t.startsWith('```')) {
+        if (!inCode) {
+          await clickPlusMenuItem(page, 'コード');
+          await page.waitForTimeout(300);
+          inCode = true;
+        } else {
+          // コードブロックから抜ける（下に新しい段落を作る）
+          await page.keyboard.press('Control+Enter');
+          await page.waitForTimeout(300);
+          inCode = false;
+        }
+        continue;
+      }
+      if (inCode) {
+        await page.keyboard.type(line, { delay: 3 });
+        await page.keyboard.press('Enter');
+        continue;
+      }
+
+      // 空行
+      if (t === '') {
+        await page.keyboard.press('Enter');
+        continue;
+      }
+
+      // 区切り線（--- ）2026-09-10: 空行扱いだったのを実際の区切り線に
+      if (/^(-{3,}|_{3,}|\*{3,})$/.test(t)) {
+        await closeBlocks();
+        await clickPlusMenuItem(page, '区切り線');
+        await page.waitForTimeout(300);
+        continue;
+      }
+
+      // 表（| a | b |）noteに表機能はないので「見出し：値」の箇条書きに変換する
+      // 2026-09-10追加: 未対応でパイプ記号がそのまま入っていた
+      if (t.startsWith('|')) {
+        const cells = t.split('|').slice(1, -1).map(c => c.trim());
+        if (cells.every(c => /^:?-{2,}:?$/.test(c))) continue;   // 区切り行は捨てる
+        if (!tableHeader) { tableHeader = cells; continue; }      // 1行目は見出しとして保持
+        if (!inList) { await clickPlusMenuItem(page, '箇条書きリスト'); await page.waitForTimeout(300); inList = true; }
+        await typeRichText(page, cells.join('：'));
+        await page.keyboard.press('Enter');
+        continue;
+      }
+      if (tableHeader && !t.startsWith('|')) tableHeader = null;
+
+      // H1 章タイトル（# ）noteの見出しは2段階なので大見出しに割り当てる
+      // 2026-09-10追加: 未対応で「# 第1章…」が文字のまま入っていた
+      if (t.startsWith('# ')) {
+        await closeBlocks();
+        await clickPlusMenuItem(page, '大見出し');
+        await page.waitForTimeout(300);
+        await typeRichText(page, t.slice(2));
         await page.keyboard.press('Enter');
         continue;
       }
 
       // H2 大見出し（## ）
       if (t.startsWith('## ')) {
+        await closeBlocks();
         await clickPlusMenuItem(page, '大見出し');
         await page.waitForTimeout(300);
         await typeRichText(page, t.slice(3));
@@ -1045,6 +1131,7 @@ app.post('/publish', async (req, res) => {
 
       // H3 小見出し（### ）
       if (t.startsWith('### ')) {
+        await closeBlocks();
         await clickPlusMenuItem(page, '小見出し');
         await page.waitForTimeout(300);
         await typeRichText(page, t.slice(4));
@@ -1064,14 +1151,26 @@ app.post('/publish', async (req, res) => {
         continue;
       }
 
-      // 箇条書き（- または * ）
+      // 箇条書き（- または * ）2026-09-10: メニュー名が「箇条書きリスト」に変わっていた
       if (t.startsWith('- ') || t.startsWith('* ')) {
         if (!inList) {
-          await clickPlusMenuItem(page, '箇条書き');
+          await clickPlusMenuItem(page, '箇条書きリスト');
           await page.waitForTimeout(300);
           inList = true;
         }
         await typeRichText(page, t.slice(2));
+        await page.keyboard.press('Enter');
+        continue;
+      }
+
+      // 番号付きリスト（1. 2. 3. ）2026-09-10追加
+      if (/^\d+\. /.test(t)) {
+        if (!inNumList) {
+          await clickPlusMenuItem(page, '番号付きリスト');
+          await page.waitForTimeout(300);
+          inNumList = true;
+        }
+        await typeRichText(page, t.replace(/^\d+\.\s*/, ''));
         await page.keyboard.press('Enter');
         continue;
       }
@@ -1082,7 +1181,8 @@ app.post('/publish', async (req, res) => {
     }
 
     // ブロック終了処理
-    if (inList) { await page.keyboard.press('Backspace'); await page.waitForTimeout(200); }
+    if (inCode) { await page.keyboard.press('Control+Enter'); await page.waitForTimeout(200); }
+    if (inList || inNumList) { await page.keyboard.press('Backspace'); await page.waitForTimeout(200); }
     if (inQuote) { await page.keyboard.press('Enter'); await page.waitForTimeout(200); }
 
     await page.waitForTimeout(2000);
