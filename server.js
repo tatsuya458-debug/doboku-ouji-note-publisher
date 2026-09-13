@@ -523,6 +523,29 @@ app.post('/set-paid', async (req, res) => {
     await page.waitForTimeout(15000);
     if (page.url().includes('/login')) { await browser.close(); publishing = false; return res.json({ success: false, error: 'cookie expired' }); }
 
+    // inspectOnly: 何も変更せず、編集画面に有料エリアの区切りが表示されているかだけ調べる
+    // 2026-09-11: APIのseparatorがnullのままなので、実画面が真実かを確かめるために追加
+    if ((req.body || {}).inspectOnly) {
+      const found = await page.evaluate(() => {
+        const hits = [];
+        document.querySelectorAll('*').forEach(el => {
+          if (el.childElementCount > 0) return;
+          const t = (el.textContent || '').trim();
+          if (t && /有料|ここから先|エリア/.test(t) && t.length < 60) {
+            const r = el.getBoundingClientRect();
+            hits.push(el.tagName + ' "' + t + '" vis=' + (r.width > 0 && r.height > 0) + ' top=' + Math.round(r.top));
+          }
+        });
+        const editor = document.querySelector('[contenteditable="true"]');
+        return {
+          hits: hits.slice(0, 20),
+          editorHtmlTail: editor ? editor.innerHTML.replace(/ (name|id)="[^"]*"/g, '').slice(-1200) : 'no-editor',
+        };
+      });
+      await browser.close(); publishing = false;
+      return res.json({ success: true, inspectOnly: true, key, ...found });
+    }
+
     // 1. 有料エリアの開始位置にキャレットを置く
     const placed = await page.evaluate((a) => {
       const nodes = [...document.querySelectorAll('h1,h2,h3,p')];
