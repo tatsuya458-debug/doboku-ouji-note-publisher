@@ -804,6 +804,7 @@ app.post('/publish', async (req, res) => {
   let refreshedCookie = null;
   // 有料記事用（2026-09-08追加）
   let paidAreaInserted = false;
+  let paidAreaCheck = null;   // 有料エリアが正しい位置に入ったかの実測結果
   let paidResult = null;
 
   // サムネイルを一時ファイルに保存
@@ -1030,6 +1031,8 @@ app.post('/publish', async (req, res) => {
     let inQuote = false;
     let inCode = false;      // コードブロック（2026-09-10追加）
     let tableHeader = null;  // 表の見出し行を一時保持（2026-09-10追加）
+    let paidAnchorPending = false;  // <<<PAID>>> の直後の行を探している最中か
+    let paidAnchorText = '';        // 有料エリアの先頭になる行のテキスト
 
     // 見出しや区切り線を入れる前に、開いているリスト・引用から抜ける
     const closeBlocks = async () => {
@@ -1075,12 +1078,15 @@ app.post('/publish', async (req, res) => {
       // 有料エリアの区切り（2026-09-08追加）
       // 本文中に <<<PAID>>> の行があれば、そこに note の「有料エリア指定」を挿入する。
       // これ以降が購入者だけに見える範囲になる。
+      // 2026-09-11修正: 執筆中に挿入すると、その後に打った本文が区切りより上に入り
+      //   有料部分が空（textcount=0）になる。位置だけ覚えて、書き終えてから挿入する。
       if (t === '<<<PAID>>>') {
-        const ok = await clickPlusMenuItem(page, '有料エリア指定');
-        console.log('有料エリア指定の挿入:', ok ? '成功' : '失敗');
-        paidAreaInserted = ok;
-        await page.waitForTimeout(1200);
+        paidAnchorPending = true;
         continue;
+      }
+      if (paidAnchorPending && t !== '') {
+        paidAnchorText = t.replace(/^#{1,6}\s*/, '').replace(/\*\*/g, '').slice(0, 30);
+        paidAnchorPending = false;
       }
 
       // コードブロック（``` で開閉）。記録テンプレートや台本に使う
@@ -1211,6 +1217,53 @@ app.post('/publish', async (req, res) => {
     await page.waitForTimeout(2000);
 
     // ============================================================
+    // Step 4b: 有料エリアの区切りを挿入（本文を全部書き終えてから）
+    // noteの区切りは <paywall-line> 要素。ここから下が購入者だけに見える。
+    // 2026-09-11: 執筆中に入れると後続の本文が区切りの上に入ってしまうため、最後に回した。
+    // ============================================================
+    if (paidAnchorText) {
+      const placed = await page.evaluate((a) => {
+        const root = document.querySelector('[contenteditable="true"]');
+        if (!root) return { ok: false, reason: 'editor not found' };
+        const nodes = [...root.querySelectorAll('h1,h2,h3,p,li')];
+        const el = nodes.find(n => (n.textContent || '').indexOf(a) >= 0);
+        if (!el) return { ok: false, reason: 'anchor not found', anchor: a };
+        el.scrollIntoView({ block: 'center' });
+        const sel = window.getSelection(); const range = document.createRange();
+        range.setStart(el, 0); range.collapse(true);
+        sel.removeAllRanges(); sel.addRange(range);
+        root.focus();
+        return { ok: true, tag: el.tagName, text: (el.textContent || '').slice(0, 40) };
+      }, paidAnchorText);
+      await page.waitForTimeout(1000);
+
+      if (placed.ok) {
+        paidAreaInserted = await clickPlusMenuItem(page, '有料エリア指定');
+        await page.waitForTimeout(2500);
+      }
+
+      // 実際に区切りが正しい位置に入り、有料部分に中身があるかをDOMで確認する
+      paidAreaCheck = await page.evaluate(() => {
+        const pw = document.querySelector('paywall-line');
+        if (!pw) return { found: false };
+        const root = document.querySelector('[contenteditable="true"]');
+        const kids = root ? [...root.children] : [];
+        const idx = kids.indexOf(pw);
+        return {
+          found: true,
+          textcount: pw.getAttribute('textcount'),
+          position: idx + 1 + '/' + kids.length,
+          nextBlock: pw.nextElementSibling ? (pw.nextElementSibling.textContent || '').slice(0, 40) : '(最後尾)',
+          prevBlock: pw.previousElementSibling ? (pw.previousElementSibling.textContent || '').slice(0, 40) : '(先頭)',
+        };
+      });
+      console.log('有料エリア:', JSON.stringify({ placed, paidAreaInserted, paidAreaCheck }));
+
+      // 挿入後は保存が必要
+      await page.waitForTimeout(1500);
+    }
+
+    // ============================================================
     // Step 5: 下書き保存
     // ============================================================
     console.log('下書き保存中...');
@@ -1309,6 +1362,7 @@ app.post('/publish', async (req, res) => {
           'input[type="number"]',
         ];
         let priceSet = false;
+        let priceSelector = null;
         for (const sel of priceSelectors) {
           const el = page.locator(sel).first();
           if (await el.isVisible({ timeout: 2000 }).catch(() => false)) {
@@ -1317,26 +1371,24 @@ app.post('/publish', async (req, res) => {
               await page.keyboard.type(String(price));
             });
             priceSet = true;
+            priceSelector = sel;
             console.log('価格を入力:', sel);
             break;
           }
         }
-        if (!priceSet) {
-          // 診断：画面にある入力欄を記録して次の修正に使う
-          const diag = await page.evaluate(() =>
-            [...document.querySelectorAll('input')].map(i =>
-              i.tagName + ' type=' + i.type + ' name=' + i.name + ' id=' + i.id + ' ph=' + (i.placeholder || '')
-            ).slice(0, 20).join(' | ')
-          );
-          console.log('価格欄が見つかりません。入力欄一覧:', diag);
-          paidResult = { paidAreaInserted, radio, priceSet: false, diag };
-        } else {
-          await page.waitForTimeout(1500);
-          paidResult = { paidAreaInserted, radio, priceSet: true };
-        }
+        await page.waitForTimeout(1500);
+        // 2026-09-11: 入力欄を推測で当てていないか確認するため、成否に関わらず入力欄の状態を記録する
+        const diag = await page.evaluate(() =>
+          [...document.querySelectorAll('input')].filter(i => i.type !== 'hidden').map(i => {
+            const lab = (i.closest('label') || {}).textContent || '';
+            return 'type=' + i.type + ' name=' + i.name + ' ph=' + (i.placeholder || '') + ' val=' + (i.type === 'radio' || i.type === 'checkbox' ? i.checked : i.value) + ' label=' + lab.trim().slice(0, 20);
+          }).slice(0, 25)
+        );
+        const pageText = await page.evaluate(() => (document.body.innerText || '').replace(/\s+/g, ' ').slice(0, 800));
+        paidResult = { paidAreaInserted, paidAreaCheck, radio, priceSet, priceSelector, diag, pageText };
       } catch (e) {
         console.log('有料設定エラー:', e.message.slice(0, 100));
-        paidResult = { paidAreaInserted, error: e.message.slice(0, 100) };
+        paidResult = { paidAreaInserted, paidAreaCheck, error: e.message.slice(0, 100) };
       }
     }
 
