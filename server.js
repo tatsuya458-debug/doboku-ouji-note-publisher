@@ -1226,14 +1226,20 @@ app.post('/publish', async (req, res) => {
         const root = document.querySelector('[contenteditable="true"]');
         if (!root) return { ok: false, reason: 'editor not found' };
         const nodes = [...root.querySelectorAll('h1,h2,h3,p,li')];
-        const el = nodes.find(n => (n.textContent || '').indexOf(a) >= 0);
-        if (!el) return { ok: false, reason: 'anchor not found', anchor: a };
-        el.scrollIntoView({ block: 'center' });
+        const hitEl = nodes.find(n => (n.textContent || '').indexOf(a) >= 0);
+        if (!hitEl) return { ok: false, reason: 'anchor not found', anchor: a };
+        // 2026-09-14実測: ＋メニューは「カーソルのあるブロックの下」に挿入する。
+        // 有料部分の先頭ブロックの“直前”のトップレベルブロックの末尾にカーソルを置く。
+        let top = hitEl;
+        while (top.parentElement && top.parentElement !== root) top = top.parentElement;
+        const prev = top.previousElementSibling;
+        if (!prev) return { ok: false, reason: 'no previous block', anchor: a };
+        prev.scrollIntoView({ block: 'center' });
         const sel = window.getSelection(); const range = document.createRange();
-        range.setStart(el, 0); range.collapse(true);
+        range.selectNodeContents(prev); range.collapse(false);
         sel.removeAllRanges(); sel.addRange(range);
         root.focus();
-        return { ok: true, tag: el.tagName, text: (el.textContent || '').slice(0, 40) };
+        return { ok: true, tag: prev.tagName, prevText: (prev.textContent || '').slice(0, 40), anchorText: (top.textContent || '').slice(0, 40) };
       }, paidAnchorText);
       await page.waitForTimeout(1000);
 
@@ -1253,11 +1259,13 @@ app.post('/publish', async (req, res) => {
           found: true,
           textcount: pw.getAttribute('textcount'),
           position: idx + 1 + '/' + kids.length,
-          nextBlock: pw.nextElementSibling ? (pw.nextElementSibling.textContent || '').slice(0, 40) : '(最後尾)',
-          prevBlock: pw.previousElementSibling ? (pw.previousElementSibling.textContent || '').slice(0, 40) : '(先頭)',
+          // 空段落を飛ばして、区切りの前後で実際に文字があるブロックを返す
+          nextBlock: (() => { let n = pw.nextElementSibling; while (n && !(n.textContent || '').trim()) n = n.nextElementSibling; return n ? (n.textContent || '').slice(0, 40) : '(最後尾)'; })(),
+          prevBlock: (() => { let n = pw.previousElementSibling; while (n && !(n.textContent || '').trim()) n = n.previousElementSibling; return n ? (n.textContent || '').slice(0, 40) : '(先頭)'; })(),
         };
       });
-      console.log('有料エリア:', JSON.stringify({ placed, paidAreaInserted, paidAreaCheck }));
+      paidAreaCheck = { ...paidAreaCheck, placed, expectedNext: paidAnchorText };
+      console.log('有料エリア:', JSON.stringify({ paidAreaInserted, paidAreaCheck }));
 
       // 挿入後は保存が必要
       await page.waitForTimeout(1500);
