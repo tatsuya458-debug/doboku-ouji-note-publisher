@@ -811,7 +811,9 @@ app.post('/publish', async (req, res) => {
   let thumbPath = null;
   if (thumbnail) {
     try {
-      thumbPath = join(tmpdir(), `thumb_${crypto.randomBytes(8).toString('hex')}.png`);
+      // 2026-09-14: JPEGも受け付ける（拡張子を実データに合わせる）
+      const ext = /^data:image\/jpe?g/.test(thumbnail) ? 'jpg' : 'png';
+      thumbPath = join(tmpdir(), `thumb_${crypto.randomBytes(8).toString('hex')}.${ext}`);
       const base64Data = thumbnail.replace(/^data:image\/\w+;base64,/, '');
       writeFileSync(thumbPath, Buffer.from(base64Data, 'base64'));
     } catch (e) {
