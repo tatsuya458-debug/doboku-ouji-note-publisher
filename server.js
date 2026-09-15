@@ -237,6 +237,52 @@ async function clickPlusMenuItem(page, itemText) {
   return ok;
 }
 
+// マークダウン → note貼り付け用HTML（2026-09-15追加・paste モード用）
+// 1行ずつ入力する方式と同じ見た目になるよう対応づける：
+//   # と ## → h2（noteの大見出し） / ### → h3（小見出し） / - → ul / 1. → ol / > → blockquote
+//   ``` → pre>code / --- → hr / 表 → 「列1：列2」の箇条書き / 空行 → 空段落 / <<<PAID>>> → 出力しない
+function mdToNoteHtml_(md) {
+  const esc = s => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  const inline = s => esc(s).replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>').replace(/`([^`]+)`/g, '<code>$1</code>');
+  const out = [];
+  let list = null, quote = [], code = null, tableHeader = null;
+  const flush = () => {
+    if (list) { out.push('<' + list.tag + '>' + list.items.map(i => '<li><p>' + i + '</p></li>').join('') + '</' + list.tag + '>'); list = null; }
+    if (quote.length) { out.push('<blockquote>' + quote.map(q => '<p>' + q + '</p>').join('') + '</blockquote>'); quote = []; }
+  };
+  const pushItem = (tag, html) => { if (!list || list.tag !== tag) { flush(); list = { tag, items: [] }; } list.items.push(html); };
+  for (const raw of String(md).replace(/\r\n/g, '\n').split('\n')) {
+    const t = raw.trim();
+    if (code) {
+      if (t.startsWith('```')) { out.push('<pre><code>' + esc(code.join('\n')) + '</code></pre>'); code = null; }
+      else code.push(raw);
+      continue;
+    }
+    if (t.startsWith('```')) { flush(); code = []; continue; }
+    if (!t.startsWith('|')) tableHeader = null;
+    if (t === '<<<PAID>>>') { flush(); continue; }
+    if (t === '') { flush(); out.push('<p><br></p>'); continue; }
+    if (t.startsWith('|')) {
+      const cells = t.split('|').slice(1, -1).map(c => c.trim());
+      if (cells.every(c => /^:?-{2,}:?$/.test(c))) continue;
+      if (!tableHeader) { tableHeader = cells; continue; }
+      pushItem('ul', inline(cells.join('：')));
+      continue;
+    }
+    if (/^(-{3,}|_{3,}|\*{3,})$/.test(t)) { flush(); out.push('<hr>'); continue; }
+    if (/^#{1,2} /.test(t)) { flush(); out.push('<h2>' + inline(t.replace(/^#{1,2} /, '')) + '</h2>'); continue; }
+    if (/^#{3,6} /.test(t)) { flush(); out.push('<h3>' + inline(t.replace(/^#{3,6} /, '')) + '</h3>'); continue; }
+    if (t.startsWith('- ') || t.startsWith('* ')) { if (quote.length) flush(); pushItem('ul', inline(t.slice(2))); continue; }
+    if (/^\d+\. /.test(t)) { if (quote.length) flush(); pushItem('ol', inline(t.replace(/^\d+\.\s*/, ''))); continue; }
+    if (t.startsWith('> ')) { if (list) flush(); quote.push(inline(t.slice(2))); continue; }
+    flush();
+    out.push('<p>' + inline(t) + '</p>');
+  }
+  if (code) out.push('<pre><code>' + esc(code.join('\n')) + '</code></pre>');
+  flush();
+  return out.join('');
+}
+
 // リッチテキスト入力（**太字** / `インラインコード` 対応）
 async function typeRichText(page, text) {
   const tokens = text.split(/(`[^`]+`|\*\*[^*]+\*\*)/);
@@ -786,7 +832,8 @@ app.post('/publish', async (req, res) => {
     thumbnail = null,
     magazine = '',
     price = 0,       // 有料記事の価格。0または未指定なら無料記事（2026-09-08追加）
-    dryRun = false   // trueなら「投稿する」を押さず、設定画面の状態を返して止める
+    dryRun = false,  // trueなら「投稿する」を押さず、設定画面の状態を返して止める
+    paste = false    // trueなら本文をHTMLに変換して一括貼り付け（長文用・2026-09-15追加）
   } = req.body;
 
   if (!title || !body || !cookie) {
@@ -805,6 +852,7 @@ app.post('/publish', async (req, res) => {
   // 有料記事用（2026-09-08追加）
   let paidAreaInserted = false;
   let paidAreaCheck = null;   // 有料エリアが正しい位置に入ったかの実測結果
+  let pasteResult = null;     // 一括貼り付けの結果（paste モード）
   let paidResult = null;
 
   // サムネイルを一時ファイルに保存
@@ -1019,8 +1067,34 @@ app.post('/publish', async (req, res) => {
 
     const rawLines = body.split('\n');
 
-    // 画像行前後の余分な空行を除去
-    const lines = rawLines.filter((line, i) => {
+    // 長文用：HTMLに変換して一括貼り付け（2026-09-15追加）
+    // 3.3万字を1文字ずつ入力するとRender無料枠(512MB)で15分以上かかり途中で落ちたため。
+    let paidAnchorTextFromPaste = '';
+    if (paste) {
+      const html = mdToNoteHtml_(body);
+      pasteResult = await page.evaluate((h) => {
+        const el = document.querySelector('div.ProseMirror[contenteditable="true"]') || document.querySelector('div[contenteditable="true"][role="textbox"]');
+        if (!el) return { ok: false, reason: 'editor not found' };
+        el.focus();
+        const dt = new DataTransfer();
+        dt.setData('text/html', h);
+        dt.setData('text/plain', ' ');
+        const ev = new ClipboardEvent('paste', { clipboardData: dt, bubbles: true, cancelable: true });
+        el.dispatchEvent(ev);
+        return { ok: true, handled: ev.defaultPrevented, htmlLen: h.length, editorLen: el.innerHTML.length };
+      }, html);
+      console.log('一括貼り付け:', JSON.stringify(pasteResult));
+      await page.waitForTimeout(5000);
+      // 有料区切りの位置（<<<PAID>>> の次の行）だけ拾っておく
+      const pi = rawLines.findIndex(l => l.trim() === '<<<PAID>>>');
+      if (pi >= 0) {
+        const nxt = rawLines.slice(pi + 1).find(l => l.trim() !== '');
+        if (nxt) paidAnchorTextFromPaste = nxt.trim().replace(/^#{1,6}\s*/, '').replace(/\*\*/g, '').slice(0, 30);
+      }
+    }
+
+    // 画像行前後の余分な空行を除去（貼り付けモードでは1行ずつの入力をしない）
+    const lines = paste ? [] : rawLines.filter((line, i) => {
       const t = line.trim();
       if (t !== '') return true;
       const prevImg = i > 0 && /^!\[/.test(rawLines[i - 1].trim());
@@ -1034,7 +1108,7 @@ app.post('/publish', async (req, res) => {
     let inCode = false;      // コードブロック（2026-09-10追加）
     let tableHeader = null;  // 表の見出し行を一時保持（2026-09-10追加）
     let paidAnchorPending = false;  // <<<PAID>>> の直後の行を探している最中か
-    let paidAnchorText = '';        // 有料エリアの先頭になる行のテキスト
+    let paidAnchorText = paidAnchorTextFromPaste;  // 有料エリアの先頭になる行のテキスト
 
     // 見出しや区切り線を入れる前に、開いているリスト・引用から抜ける
     const closeBlocks = async () => {
@@ -1441,7 +1515,7 @@ app.post('/publish', async (req, res) => {
       return res.json(saveResult_({
         success: true, dryRun: true, draftUrl,
         message: '下書きを作成し、設定画面まで進めました（投稿はしていません）',
-        thumbnailSet, thumbDiag, paidResult, newCookie: refreshedCookie,
+        thumbnailSet, thumbDiag, paidResult, pasteResult, newCookie: refreshedCookie,
       }));
     }
 
