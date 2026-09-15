@@ -1447,18 +1447,30 @@ app.post('/publish', async (req, res) => {
         ];
         let priceSet = false;
         let priceSelector = null;
-        for (const sel of priceSelectors) {
-          const el = page.locator(sel).first();
-          if (await el.isVisible({ timeout: 2000 }).catch(() => false)) {
-            await el.click({ force: true }).catch(() => {});
-            await el.fill(String(price)).catch(async () => {
-              await page.keyboard.type(String(price));
-            });
-            priceSet = true;
-            priceSelector = sel;
-            console.log('価格を入力:', sel);
-            break;
+        // 2026-09-15: 長文だと描画が遅く価格欄がまだ無い→初期値300円のまま残った。出現を待つ
+        await page.waitForSelector('input[id*="price"], input[placeholder="300"]', { timeout: 30000 }).catch(() => {});
+        for (let attempt = 0; attempt < 3 && !priceSet; attempt++) {
+          for (const sel of priceSelectors) {
+            const el = page.locator(sel).first();
+            if (await el.isVisible({ timeout: 2000 }).catch(() => false)) {
+              await el.click({ force: true }).catch(() => {});
+              await el.fill(String(price)).catch(async () => {
+                await page.keyboard.press('Control+a');
+                await page.keyboard.type(String(price));
+              });
+              await el.blur().catch(() => {});
+              await page.waitForTimeout(800);
+              // 入った値を読み返して確認（推測で成功扱いにしない）
+              const v = await el.inputValue().catch(() => '');
+              if (String(v).replace(/[^\d]/g, '') === String(price)) {
+                priceSet = true;
+                priceSelector = sel;
+                console.log('価格を入力:', sel, v);
+              }
+              break;
+            }
           }
+          if (!priceSet) await page.waitForTimeout(3000);
         }
         await page.waitForTimeout(1500);
         // 2026-09-11: 入力欄を推測で当てていないか確認するため、成否に関わらず入力欄の状態を記録する
