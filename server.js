@@ -1128,7 +1128,7 @@ app.post('/delete-drafts', async (req, res) => {
             .map(n => ({ key: n.key || n.id, title: n.name || (n.noteDraft || {}).name || '' }));
         });
 
-        const openMenu = await page.evaluate((args) => {
+        const openMenuOnce = async () => await page.evaluate((args) => {
           const { drafts, target } = args;
           const entries = [...document.querySelectorAll('[aria-label*="を編集"]')];
           if (entries.length !== drafts.length) {
@@ -1160,8 +1160,25 @@ app.post('/delete-drafts', async (req, res) => {
           kebab.click();
           return { ok: true, index: idx, matchedTitle: titleOf(el), aria: kebab.getAttribute('aria-label') || '(なし)' };
         }, { drafts: apiDrafts, target: key });
+
+        // メニューは遅れて描画されることがある（2026-09-16: 2.5秒固定待ちで8件取りこぼした）。
+        // 「削除」が出るまで待ち、出なければ一度だけ押し直す。
+        const deleteVisible = () => page.waitForFunction(() =>
+          [...document.querySelectorAll('button, [role="menuitem"], a')]
+            .some(b => b.offsetParent !== null && /^(削除|削除する|下書きを削除)$/.test((b.textContent || '').trim())),
+          { timeout: 8000 }).then(() => true).catch(() => false);
+
+        let openMenu = await openMenuOnce();
         if (!openMenu.ok) { results.push({ key, title: meta.title, skipped: openMenu.reason }); continue; }
-        await page.waitForTimeout(2500);
+        let ready = await deleteVisible();
+        if (!ready) {
+          await page.keyboard.press('Escape').catch(() => {});
+          await page.waitForTimeout(1500);
+          openMenu = await openMenuOnce();
+          openMenu.retried = true;
+          ready = await deleteVisible();
+        }
+        if (!ready) { results.push({ key, title: meta.title, skipped: '「…」を押したが削除メニューが出ない', openMenu }); continue; }
 
         const menuItems = await page.evaluate(() =>
           [...document.querySelectorAll('button, [role="menuitem"], a')]
