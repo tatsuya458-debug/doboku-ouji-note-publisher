@@ -854,6 +854,7 @@ app.post('/publish', async (req, res) => {
   let paidAreaCheck = null;   // 有料エリアが正しい位置に入ったかの実測結果
   let pasteResult = null;     // 一括貼り付けの結果（paste モード）
   let paidResult = null;
+  let tagsApplied = null;     // 画面に実際に付いたハッシュタグ（読み返して確認・2026-09-16追加）
 
   // サムネイルを一時ファイルに保存
   let thumbPath = null;
@@ -1410,11 +1411,26 @@ app.post('/publish', async (req, res) => {
             await page.keyboard.press('Enter');
             await page.waitForTimeout(500);
           }
-          console.log('タグ設定完了');
+          // 2026-09-16: 入れっぱなしにせず、画面に出ているタグを読み返して確認する。
+          // note側が自動候補（#会社 など）を勝手に足すので、shown には希望外のタグも入る。
+          await page.waitForTimeout(1500);
+          tagsApplied = await page.evaluate((wanted) => {
+            const shown = new Set();
+            document.querySelectorAll('*').forEach(el => {
+              if (el.childElementCount !== 0) return;
+              const t = (el.textContent || '').trim();
+              if (/^#\S/.test(t) && t.length < 30) shown.add(t.replace(/^#/, ''));
+            });
+            const list = [...shown];
+            return { shown: list, missing: wanted.filter(w => !list.includes(w)) };
+          }, tags.slice(0, 10));
+          console.log('タグ確認:', JSON.stringify(tagsApplied));
         } else {
+          tagsApplied = { error: 'タグ入力欄が見つかりません' };
           console.log('タグ入力欄が見つかりません（続行）');
         }
       } catch (e) {
+        tagsApplied = { error: e.message.slice(0, 80) };
         console.log('タグ設定失敗（続行）:', e.message.slice(0, 80));
       }
     }
@@ -1527,7 +1543,7 @@ app.post('/publish', async (req, res) => {
       return res.json(saveResult_({
         success: true, dryRun: true, draftUrl,
         message: '下書きを作成し、設定画面まで進めました（投稿はしていません）',
-        thumbnailSet, thumbDiag, paidResult, pasteResult, newCookie: refreshedCookie,
+        thumbnailSet, thumbDiag, paidResult, pasteResult, tagsApplied, newCookie: refreshedCookie,
       }));
     }
 
@@ -1629,7 +1645,7 @@ app.post('/publish', async (req, res) => {
     if (thumbPath && existsSync(thumbPath)) { try { unlinkSync(thumbPath); } catch {} }
 
     if (noteUrl) {
-      return res.json(saveResult_({ success: true, url: noteUrl, newCookie: refreshedCookie, thumbnailSet, thumbDiag, paidResult }));
+      return res.json(saveResult_({ success: true, url: noteUrl, newCookie: refreshedCookie, thumbnailSet, thumbDiag, paidResult, tagsApplied }));
     }
     return res.json(saveResult_({ success: false, error: '投稿完了したがURL取得失敗', newCookie: refreshedCookie, thumbnailSet, thumbDiag }));
 
