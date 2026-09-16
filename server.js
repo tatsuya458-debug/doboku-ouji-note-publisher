@@ -1112,31 +1112,54 @@ app.post('/delete-drafts', async (req, res) => {
       try {
         // 2026-09-16実測：編集画面の「メニューを開く」はブロック挿入用（＋メニュー）で削除は無い。
         // 削除は記事一覧（note.com/notes）の、カードごとの「…」メニューにある。
+        //
+        // ただし下書きカードにはキーがDOMのどこにも出ない（hrefが無く button のみ）。
+        // そこで「APIの下書き順」と「カードの並び順」を突き合わせて位置で対応づける。
+        // 取り違えると別の記事を消すので、**全件のタイトルが一致しなければ何もしない**。
         await page.goto('https://note.com/notes', { waitUntil: 'domcontentloaded', timeout: 60000 });
         await page.waitForTimeout(9000);
 
-        // 対象のカードを key へのリンクから特定し、その中の「…」ボタンだけを押す。
-        // 別のカードのメニューを開いて誤爆しないよう、必ずカード内に限定する。
-        const openMenu = await page.evaluate((k) => {
-          const link = [...document.querySelectorAll('a[href*="' + k + '"]')][0];
-          if (!link) return { ok: false, reason: 'カードが見つからない' };
-          let card = link;
+        const apiDrafts = await page.evaluate(async () => {
+          const r = await fetch('/api/v2/note_list/contents?limit=50&page=1', { credentials: 'include' });
+          const j = await r.json();
+          const list = (j && j.data && (j.data.contents || j.data.notes)) || [];
+          return (Array.isArray(list) ? list : [])
+            .filter(n => n.status === 'draft')
+            .map(n => ({ key: n.key || n.id, title: n.name || (n.noteDraft || {}).name || '' }));
+        });
+
+        const openMenu = await page.evaluate((args) => {
+          const { drafts, target } = args;
+          const entries = [...document.querySelectorAll('[aria-label*="を編集"]')];
+          if (entries.length !== drafts.length) {
+            return { ok: false, reason: 'カード数(' + entries.length + ')とAPIの下書き数(' + drafts.length + ')が一致しない' };
+          }
+          // 並びが本当に同じかを全件のタイトルで照合する
+          const titleOf = (el) => (el.getAttribute('aria-label') || '').replace(/を編集$/, '');
+          for (let i = 0; i < drafts.length; i++) {
+            const shown = titleOf(entries[i]);
+            const want = drafts[i].title || 'タイトル未設定';
+            if (shown !== want) {
+              return { ok: false, reason: '並びが一致しない: ' + i + '番目 画面="' + shown + '" API="' + want + '"' };
+            }
+          }
+          const idx = drafts.findIndex(d => d.key === target);
+          if (idx < 0) return { ok: false, reason: '対象が下書き一覧に無い' };
+
+          const el = entries[idx];
+          let card = el;
           for (let i = 0; i < 8 && card.parentElement; i++) {
             card = card.parentElement;
-            if (card.querySelector('button')) break;
+            if (card.querySelectorAll('button').length >= 2) break;
           }
           const btns = [...card.querySelectorAll('button')];
-          if (!btns.length) return { ok: false, reason: 'カード内にボタンが無い' };
-          // 「…」はテキストを持たず aria-label で表される
-          const kebab = btns.find(b => /メニュー|その他|オプション|設定/.test(b.getAttribute('aria-label') || '')) || btns[btns.length - 1];
+          // 「編集」ボタン以外＝「…」。名前で拾えないので、編集ボタンを除外して選ぶ
+          const kebab = btns.find(b => b !== el && !/を編集$/.test(b.getAttribute('aria-label') || ''));
+          if (!kebab) return { ok: false, reason: 'カード内に「…」ボタンが無い', cardButtons: btns.length };
           kebab.scrollIntoView({ block: 'center' });
           kebab.click();
-          return {
-            ok: true,
-            aria: kebab.getAttribute('aria-label') || '(なし)',
-            cardButtons: btns.map(b => (b.getAttribute('aria-label') || (b.textContent || '').trim() || '(無名)').slice(0, 20)),
-          };
-        }, key);
+          return { ok: true, index: idx, matchedTitle: titleOf(el), aria: kebab.getAttribute('aria-label') || '(なし)' };
+        }, { drafts: apiDrafts, target: key });
         if (!openMenu.ok) { results.push({ key, title: meta.title, skipped: openMenu.reason }); continue; }
         await page.waitForTimeout(2500);
 
