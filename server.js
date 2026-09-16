@@ -647,6 +647,221 @@ app.post('/set-paid', async (req, res) => {
 });
 
 // ============================================================
+// POST /publish-existing … 既存の下書きを、noteの正規フローで有料公開する（2026-09-16追加）
+// Body: { cookie, key, price, tags?, paidAnchor, confirm, dryRun? }
+//
+// 2026-09-16の実測で判明した正しい手順。/publish のように3万字を入れ直さないので
+// 下書きが増えず、1分で終わる。
+//   1. /notes/{key}/publish/ を開く
+//   2. 「有料」を選んで価格を入れる
+//   3. 「有料エリア設定」を押す → 各ブロックの前に「ラインをこの場所に変更」が並ぶ画面になる
+//   4. paidAnchor の直前のボタンを押す → 右上が「投稿する」になる
+//   5. 「投稿する」を押す
+//
+// 自前で編集画面に paywall-line を挿入する旧方式は、DOMには入るがサーバーに保存されず
+// （separator=null）、公開画面で投稿ボタンが出ない原因になっていた。
+// ============================================================
+app.post('/publish-existing', async (req, res) => {
+  const b = req.body || {};
+  const cookie = String(b.cookie || '');
+  const key = String(b.key || '');
+  const price = Number(b.price || 0);
+  const paidAnchor = String(b.paidAnchor || '');
+  const tags = Array.isArray(b.tags) ? b.tags.map(String).filter(Boolean) : [];
+  const dryRun = !!b.dryRun;
+  if (!cookie || !key) return res.status(400).json({ success: false, error: 'cookie, key required' });
+  if (price > 0 && !paidAnchor) return res.status(400).json({ success: false, error: '有料にするなら paidAnchor（有料エリアの開始行）が必要です' });
+  if (!dryRun && !b.confirm) return res.status(400).json({ success: false, error: 'confirm:true required（公開と価格は取り消せません）' });
+  if (publishing) return res.status(429).json({ success: false, busy: true });
+  publishing = true;
+
+  const steps = [];
+  let browser;
+  try {
+    browser = await chromium.launch({ args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu', '--single-process'] });
+    const context = await browser.newContext({ userAgent: NOTE_UA, viewport: { width: 1280, height: 900 } });
+    const parsed = cookie.split('; ').map(c => { const i = c.indexOf('='); return { name: c.substring(0, i).trim(), value: c.substring(i + 1).trim(), path: '/' }; }).filter(c => c.name && c.value);
+    await context.addCookies([...parsed.map(c => ({ ...c, domain: '.note.com' })), ...parsed.map(c => ({ ...c, domain: 'editor.note.com' }))]);
+    const page = await context.newPage();
+
+    // 右上の主ボタン（「投稿する」／「有料エリア設定」）を読む。ここが手順の進行度を示す。
+    const topCta = async () => await page.evaluate(() =>
+      [...document.querySelectorAll('button')]
+        .filter(x => { const r = x.getBoundingClientRect(); return r.top >= 0 && r.top < 60 && r.width > 0; })
+        .map(x => (x.textContent || '').trim()).filter(Boolean)
+    );
+
+    // --- 1. 公開設定画面を開く ---
+    await page.goto('https://editor.note.com/notes/' + key + '/publish/', { waitUntil: 'domcontentloaded', timeout: 60000 });
+    await page.waitForTimeout(15000);
+    if (page.url().includes('/login')) { await browser.close(); publishing = false; return res.json({ success: false, error: 'cookie expired' }); }
+    steps.push({ step: '1_open', url: page.url(), cta: await topCta() });
+
+    // --- 2. ハッシュタグ（任意）---
+    let tagsApplied = null;
+    if (tags.length) {
+      try {
+        const nav = page.locator('button:has-text("ハッシュタグ")').first();
+        if (await nav.isVisible({ timeout: 3000 }).catch(() => false)) { await nav.click({ force: true }); await page.waitForTimeout(1500); }
+        const input = page.locator('input[placeholder*="ハッシュタグ"], input[placeholder*="タグ"]').first();
+        if (await input.isVisible({ timeout: 5000 }).catch(() => false)) {
+          for (const t of tags.slice(0, 10)) {
+            await input.click({ force: true }); await input.fill(t);
+            await page.waitForTimeout(400); await page.keyboard.press('Enter'); await page.waitForTimeout(700);
+          }
+          await page.waitForTimeout(1500);
+          tagsApplied = await page.evaluate((wanted) => {
+            const shown = new Set();
+            document.querySelectorAll('*').forEach(el => {
+              if (el.childElementCount !== 0) return;
+              const t = (el.textContent || '').trim();
+              if (/^#\S/.test(t) && t.length < 30) shown.add(t.replace(/^#/, ''));
+            });
+            const list = [...shown];
+            return { shown: list, missing: wanted.filter(w => !list.includes(w)) };
+          }, tags.slice(0, 10));
+        } else {
+          tagsApplied = { error: 'タグ入力欄が見つかりません' };
+        }
+      } catch (e) { tagsApplied = { error: e.message.slice(0, 80) }; }
+      steps.push({ step: '2_tags', tagsApplied });
+    }
+
+    // --- 3. 有料を選んで価格を入れる ---
+    let priceState = null;
+    if (price > 0) {
+      const radio = await page.evaluate(() => {
+        const rs = [...document.querySelectorAll('input[name="is_paid"]')];
+        if (rs.length < 2) return { ok: false, reason: 'ラジオが見つからない(' + rs.length + ')' };
+        const target = rs.find(r => r.value === 'paid') || rs[rs.length - 1];
+        target.scrollIntoView({ block: 'center' });
+        const lbl = target.closest('label') || document.querySelector('label[for="' + target.id + '"]');
+        (lbl || target).click();
+        return { ok: true, checked: target.checked };
+      });
+      await page.waitForTimeout(5000);
+      await page.waitForSelector('input[id*="price"], input[name*="price"]', { timeout: 30000 }).catch(() => {});
+      const el = page.locator('input[id*="price"], input[name*="price"]').first();
+      if (await el.isVisible({ timeout: 4000 }).catch(() => false)) {
+        await el.click({ force: true }).catch(() => {});
+        await el.fill(String(price)).catch(() => {});
+        await page.waitForTimeout(1500);
+      }
+      // 入れっぱなしにせず読み返す
+      const readBack = await page.evaluate(() => {
+        const i = document.querySelector('input[id*="price"], input[name*="price"]');
+        const paid = [...document.querySelectorAll('input[name="is_paid"]')].find(r => r.checked);
+        return { priceValue: i ? i.value : null, isPaid: paid ? paid.value : null };
+      });
+      priceState = { radio, ...readBack };
+      steps.push({ step: '3_price', priceState, cta: await topCta() });
+      if (readBack.priceValue !== String(price)) {
+        await browser.close(); publishing = false;
+        return res.json(saveResult_({ success: false, error: '価格が入らなかった（' + readBack.priceValue + '）', steps }));
+      }
+    }
+
+    // --- 4. 「有料エリア設定」→ paidAnchor の直前の「ラインをこの場所に変更」を押す ---
+    let paidArea = null;
+    if (price > 0) {
+      const opened = await page.evaluate(() => {
+        const el = [...document.querySelectorAll('button')].find(x => (x.textContent || '').trim() === '有料エリア設定' && x.offsetParent !== null);
+        if (!el) return { ok: false };
+        el.click(); return { ok: true };
+      });
+      if (!opened.ok) {
+        await browser.close(); publishing = false;
+        return res.json(saveResult_({ success: false, error: '「有料エリア設定」ボタンが見つかりません', steps }));
+      }
+      await page.waitForTimeout(9000);
+
+      // アンカー行より前にある最後の「ラインをこの場所に変更」を選ぶ（＝その行から有料になる）
+      paidArea = await page.evaluate((anchor) => {
+        const LABEL = 'ラインをこの場所に変更';
+        const btns = [...document.querySelectorAll('button')].filter(x => (x.textContent || '').trim() === LABEL);
+        if (!btns.length) return { ok: false, reason: 'ラインのボタンが無い' };
+        const anchorEl = [...document.querySelectorAll('*')]
+          .find(el => el.childElementCount === 0 && (el.textContent || '').indexOf(anchor) >= 0);
+        if (!anchorEl) return { ok: false, reason: 'アンカーが見つからない', anchor, total: btns.length };
+        let best = null;
+        for (const x of btns) {
+          // x が anchorEl より前にあるか
+          if (x.compareDocumentPosition(anchorEl) & Node.DOCUMENT_POSITION_FOLLOWING) best = x; else break;
+        }
+        if (!best) return { ok: false, reason: 'アンカーより前にラインのボタンが無い', total: btns.length };
+        // 押す前に、選んだ位置の直後にくる文字を控えておく（あとで照合する）
+        let n = best.nextElementSibling;
+        while (n && !(n.textContent || '').trim()) n = n.nextElementSibling;
+        const nextText = n ? (n.textContent || '').replace(LABEL, '').trim().slice(0, 40) : '(なし)';
+        best.scrollIntoView({ block: 'center' });
+        best.click();
+        return { ok: true, total: btns.length, nextText, anchor };
+      }, paidAnchor);
+      await page.waitForTimeout(8000);
+      paidArea.ctaAfter = await topCta();
+      steps.push({ step: '4_paid_area', paidArea });
+      if (!paidArea.ok) {
+        await browser.close(); publishing = false;
+        return res.json(saveResult_({ success: false, error: '有料エリアの位置を指定できませんでした', steps }));
+      }
+    }
+
+    // --- 5. 「投稿する」---
+    const cta = await topCta();
+    const hasPost = cta.some(t => /投稿する|公開する/.test(t));
+    if (!hasPost) {
+      const diag = await page.evaluate(() => [...document.querySelectorAll('button')].map(x => (x.textContent || '').trim()).filter(Boolean).slice(0, 40));
+      await browser.close(); publishing = false;
+      return res.json(saveResult_({ success: false, error: '「投稿する」が出ていません', cta, diag, steps }));
+    }
+    if (dryRun) {
+      await browser.close(); publishing = false;
+      return res.json(saveResult_({ success: true, dryRun: true, message: '「投稿する」が出るところまで確認（押していません）', cta, steps, tagsApplied }));
+    }
+
+    const posted = await page.evaluate(() => {
+      const el = [...document.querySelectorAll('button')]
+        .filter(x => { const r = x.getBoundingClientRect(); return r.top >= 0 && r.top < 60 && r.width > 0; })
+        .find(x => /投稿する|公開する/.test((x.textContent || '').trim()));
+      if (!el) return { ok: false };
+      el.click(); return { ok: true, text: (el.textContent || '').trim() };
+    });
+    await page.waitForTimeout(3000);
+    // 確認ダイアログが出る場合に備える
+    const confirmDlg = await page.evaluate(() => {
+      const el = [...document.querySelectorAll('button')].filter(x => x.offsetParent !== null)
+        .find(x => /^(投稿する|公開する|はい|OK)$/.test((x.textContent || '').trim()));
+      if (!el) return { needed: false };
+      el.click(); return { needed: true, text: (el.textContent || '').trim() };
+    });
+    steps.push({ step: '5_post', posted, confirmDlg });
+
+    let noteUrl = null;
+    try {
+      await page.waitForURL(/note\.com\/[^/]+\/n\/n/, { timeout: 30000 });
+      noteUrl = page.url().split('?')[0];
+    } catch { /* URL遷移しない場合は下で一覧から確かめる */ }
+
+    // 本当に公開されたかをAPIで確かめる（ボタンを押せた＝公開できた、ではない）
+    const verify = await page.evaluate(async (k) => {
+      try {
+        const r = await fetch('https://note.com/api/v2/note_list/contents?limit=50&page=1', { credentials: 'include' });
+        const j = await r.json();
+        const list = (j && j.data && (j.data.contents || j.data.notes)) || [];
+        const hit = (Array.isArray(list) ? list : []).find(n => (n.key || n.id) === k);
+        return hit ? { found: true, status: hit.status, price: hit.price, name: hit.name } : { found: false };
+      } catch (e) { return { err: e.message }; }
+    }, key);
+
+    await browser.close();
+    res.json(saveResult_({ success: verify.status === 'published', url: noteUrl, verify, steps, tagsApplied }));
+  } catch (e) {
+    if (browser) await browser.close().catch(() => {});
+    res.status(500).json({ success: false, error: e.message, steps });
+  } finally { publishing = false; }
+});
+
+// ============================================================
 // POST /inspect-publish … 既存下書きの「公開設定画面」を開いて構造を記録する（2026-09-16追加）
 // Body: { cookie, key, selectPaid?: true, price?: number }
 //
