@@ -1178,19 +1178,22 @@ app.post('/delete-drafts', async (req, res) => {
           const els = [...document.querySelectorAll('button, [role="menuitem"], a')].filter(b => b.offsetParent !== null);
           const el = els.find(b => /^(削除|削除する|下書きを削除)$/.test((b.textContent || '').trim()));
           if (!el) return { ok: false };
+          el.setAttribute('data-already-clicked', '1');   // 確認側で同じ要素を拾わないための目印
           el.click();
           return { ok: true, text: (el.textContent || '').trim() };
         });
         if (!hit.ok) { results.push({ key, title: meta.title, skipped: '削除メニューが見つからない', openMenu, menuItems }); continue; }
-        await page.waitForTimeout(2000);
+        await page.waitForTimeout(2500);
 
         const confirmed = await page.evaluate(() => {
-          const els = [...document.querySelectorAll('button, [role="button"]')].filter(b => b.offsetParent !== null);
-          // 確認ダイアログ側の「削除する」を押す。「キャンセル」は絶対に拾わない。
+          // 確認ダイアログがあればその中だけを見る。「キャンセル」は絶対に拾わない。
+          const scope = document.querySelector('[role="dialog"], [aria-modal="true"]') || document;
+          const els = [...scope.querySelectorAll('button, [role="button"]')]
+            .filter(b => b.offsetParent !== null && !b.hasAttribute('data-already-clicked'));
           const el = els.find(b => /^(削除する|削除|はい|OK)$/.test((b.textContent || '').trim()));
-          if (!el) return { ok: false, visible: els.map(b => (b.textContent || '').trim()).filter(Boolean).slice(0, 20) };
+          if (!el) return { ok: false, scoped: scope !== document, visible: els.map(b => (b.textContent || '').trim()).filter(Boolean).slice(0, 20) };
           el.click();
-          return { ok: true, text: (el.textContent || '').trim() };
+          return { ok: true, scoped: scope !== document, text: (el.textContent || '').trim() };
         });
         await page.waitForTimeout(4000);
         results.push({ key, title: meta.title, clicked: hit.text, confirmed });
