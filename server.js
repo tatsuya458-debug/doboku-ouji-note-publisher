@@ -789,13 +789,33 @@ app.post('/publish-existing', async (req, res) => {
           if (x.compareDocumentPosition(anchorEl) & Node.DOCUMENT_POSITION_FOLLOWING) best = x; else break;
         }
         if (!best) return { ok: false, reason: 'アンカーより前にラインのボタンが無い', total: btns.length };
-        // 押す前に、選んだ位置の直後にくる文字を控えておく（あとで照合する）
-        let n = best.nextElementSibling;
-        while (n && !(n.textContent || '').trim()) n = n.nextElementSibling;
-        const nextText = n ? (n.textContent || '').replace(LABEL, '').trim().slice(0, 40) : '(なし)';
+        // 押す前に「選んだ位置の直後にくる文字」を控える。
+        // ボタンは各ブロックの兄弟ではなくラッパー内にあるので、兄弟だけ見ると取れない（2026-09-16）。
+        // DOM順で後ろに進み、最初に出てくる文字を持つ末端要素を拾う。
+        const all = [...document.querySelectorAll('*')];
+        const bi = all.indexOf(best);
+        let nextText = '(なし)';
+        let prevText = '(なし)';
+        for (let i = bi + 1; i < all.length && i < bi + 400; i++) {
+          const el = all[i];
+          if (el.childElementCount !== 0) continue;
+          const t = (el.textContent || '').trim();
+          if (!t || t === LABEL) continue;
+          nextText = t.slice(0, 40); break;
+        }
+        for (let i = bi - 1; i >= 0 && i > bi - 400; i--) {
+          const el = all[i];
+          if (el.childElementCount !== 0) continue;
+          const t = (el.textContent || '').trim();
+          if (!t || t === LABEL) continue;
+          prevText = t.slice(-40); break;
+        }
+        // 直後がアンカー行でなければ押さない（位置がずれた状態で公開しないため）
+        const matches = nextText.indexOf(anchor) >= 0;
+        if (!matches) return { ok: false, reason: '選んだ位置の直後がアンカー行ではない', nextText, prevText, anchor, total: btns.length };
         best.scrollIntoView({ block: 'center' });
         best.click();
-        return { ok: true, total: btns.length, nextText, anchor };
+        return { ok: true, total: btns.length, nextText, prevText, anchor };
       }, paidAnchor);
       await page.waitForTimeout(8000);
       paidArea.ctaAfter = await topCta();
@@ -881,17 +901,20 @@ app.post('/inspect-publish', async (req, res) => {
   // 押せそうな要素を、button に限らず全部拾う（前回 button だけ見て見落とした）
   const dumpClickables = async (page, label) => await page.evaluate((lbl) => {
     const rows = [];
-    document.querySelectorAll('button, a, input[type="submit"], input[type="button"], [role="button"], [role="menuitem"], [type="radio"]').forEach(el => {
+    document.querySelectorAll('button, a, input, textarea, [contenteditable="true"], [role="button"], [role="menuitem"], [role="combobox"]').forEach(el => {
       const r = el.getBoundingClientRect();
       const txt = (el.textContent || el.value || '').trim().slice(0, 28);
       const aria = (el.getAttribute('aria-label') || '').slice(0, 28);
-      if (!txt && !aria && el.tagName !== 'INPUT') return;
+      const ph = (el.getAttribute('placeholder') || el.getAttribute('data-placeholder') || '').slice(0, 28);
+      if (!txt && !aria && !ph && el.tagName !== 'INPUT') return;
       rows.push([
         el.tagName.toLowerCase(),
         el.getAttribute('type') || '',
         el.getAttribute('name') || '',
+        el.id ? 'id=' + el.id.slice(0, 24) : '',
         'txt="' + txt + '"',
         aria ? 'aria="' + aria + '"' : '',
+        ph ? 'ph="' + ph + '"' : '',
         'vis=' + (r.width > 0 && r.height > 0),
         'disabled=' + !!el.disabled,
         'top=' + Math.round(r.top),
