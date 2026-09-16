@@ -735,6 +735,32 @@ app.post('/inspect-publish', async (req, res) => {
       shots.push(after);
     }
 
+    // click: 指定テキストのボタンを押して、その先の画面を記録する。
+    // 「有料エリア設定」の遷移先を見るため。投稿系の文言は安全のため受け付けない。
+    const click = String((req.body || {}).click || '');
+    if (click) {
+      if (/投稿|公開|販売/.test(click)) {
+        shots.push({ label: 'click_refused', note: '投稿・公開・販売を含むボタンはこの診断用エンドポイントでは押しません' });
+      } else {
+        const r = await page.evaluate((t) => {
+          const el = [...document.querySelectorAll('button, a, [role="button"]')]
+            .find(b => (b.textContent || '').trim() === t && b.offsetParent !== null);
+          if (!el) return { ok: false };
+          el.click();
+          return { ok: true };
+        }, click);
+        await page.waitForTimeout(9000);
+        const shot = await dumpClickables(page, '4_after_click_' + click);
+        shot.clickResult = r;
+        shot.bodyText = await page.evaluate(() => (document.body.innerText || '').replace(/\s+/g, ' ').slice(0, 600));
+        shot.paywallLine = await page.evaluate(() => {
+          const pw = document.querySelector('paywall-line');
+          return pw ? { found: true, textcount: pw.getAttribute('textcount') } : { found: false };
+        });
+        shots.push(shot);
+      }
+    }
+
     await browser.close();
     res.json(saveResult_({ success: true, key, shots }));
   } catch (e) {
