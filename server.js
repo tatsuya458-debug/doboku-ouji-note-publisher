@@ -1073,6 +1073,23 @@ app.post('/delete-drafts', async (req, res) => {
     const before = await snapshot();
     if (before.__error) { await browser.close(); publishing = false; return res.json({ success: false, error: '一覧取得失敗: ' + before.__error }); }
 
+    // inspectOnly のときは一覧ページ自体の構造も1回だけ記録する。
+    // 2026-09-16: a[href*=key] が見つからず「カードが見つからない」で止まったため。
+    let listPage = null;
+    if (inspectOnly) {
+      listPage = await page.evaluate(() => ({
+        url: location.href,
+        tabs: [...document.querySelectorAll('button, a[role="tab"], [role="tab"], nav a')]
+          .filter(x => x.offsetParent !== null)
+          .map(x => (x.getAttribute('aria-label') || (x.textContent || '').trim()).slice(0, 24))
+          .filter(Boolean).slice(0, 30),
+        anchorCount: document.querySelectorAll('a').length,
+        noteHrefs: [...document.querySelectorAll('a')].map(a => a.getAttribute('href') || '')
+          .filter(h => /\/n[0-9a-f]{8,}/.test(h) || h.indexOf('/notes/') >= 0).slice(0, 20),
+        bodyText: (document.body.innerText || '').replace(/\s+/g, ' ').slice(0, 700),
+      }));
+    }
+
     const results = [];
     for (const key of keys) {
       const meta = before[key];
@@ -1154,7 +1171,7 @@ app.post('/delete-drafts', async (req, res) => {
     const remaining = after.__error ? null : Object.keys(after).map(k => k + ' | ' + after[k].status + ' | ' + after[k].title.slice(0, 30));
 
     await browser.close();
-    res.json(saveResult_({ success: true, inspectOnly, results: verified, remaining }));
+    res.json(saveResult_({ success: true, inspectOnly, listPage, results: verified, remaining }));
   } catch (e) {
     if (browser) await browser.close().catch(() => {});
     res.status(500).json({ success: false, error: e.message });
