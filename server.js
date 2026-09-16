@@ -706,8 +706,13 @@ app.post('/publish-existing', async (req, res) => {
         const input = page.locator('input[placeholder*="ハッシュタグ"], input[placeholder*="タグ"]').first();
         if (await input.isVisible({ timeout: 5000 }).catch(() => false)) {
           for (const t of tags.slice(0, 10)) {
-            await input.click({ force: true }); await input.fill(t);
-            await page.waitForTimeout(400); await page.keyboard.press('Enter'); await page.waitForTimeout(700);
+            // fill() だと値は入るがReactに伝わらず、Enterで確定されない（2026-09-16実測）。
+            // 実際のキー入力にする。
+            await input.click({ force: true });
+            await page.keyboard.type(t, { delay: 60 });
+            await page.waitForTimeout(900);
+            await page.keyboard.press('Enter');
+            await page.waitForTimeout(900);
           }
           await page.waitForTimeout(1500);
           tagsApplied = await page.evaluate((wanted) => {
