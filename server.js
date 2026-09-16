@@ -719,15 +719,18 @@ app.post('/publish-existing', async (req, res) => {
             tagTrace.push({ tag: t, typed, afterEnter });
           }
           await page.waitForTimeout(1500);
+          // 確定済みタグは「#」付きで出るとは限らない（2026-09-16実測）。#の有無を問わず照合する。
           tagsApplied = await page.evaluate((wanted) => {
-            const shown = new Set();
+            const seen = new Set();
             document.querySelectorAll('*').forEach(el => {
               if (el.childElementCount !== 0) return;
               const t = (el.textContent || '').trim();
-              if (/^#\S/.test(t) && t.length < 30) shown.add(t.replace(/^#/, ''));
+              if (t && t.length < 30) seen.add(t.replace(/^#/, ''));
             });
-            const list = [...shown];
-            return { shown: list, missing: wanted.filter(w => !list.includes(w)) };
+            return {
+              added: wanted.filter(w => seen.has(w)),
+              missing: wanted.filter(w => !seen.has(w)),
+            };
           }, tags.slice(0, 10));
         } else {
           tagsApplied = { error: 'タグ入力欄が見つかりません' };
@@ -1918,15 +1921,18 @@ app.post('/publish', async (req, res) => {
           // 2026-09-16: 入れっぱなしにせず、画面に出ているタグを読み返して確認する。
           // note側が自動候補（#会社 など）を勝手に足すので、shown には希望外のタグも入る。
           await page.waitForTimeout(1500);
+          // 確定済みタグは「#」付きで出るとは限らない（2026-09-16実測）。#の有無を問わず照合する。
           tagsApplied = await page.evaluate((wanted) => {
-            const shown = new Set();
+            const seen = new Set();
             document.querySelectorAll('*').forEach(el => {
               if (el.childElementCount !== 0) return;
               const t = (el.textContent || '').trim();
-              if (/^#\S/.test(t) && t.length < 30) shown.add(t.replace(/^#/, ''));
+              if (t && t.length < 30) seen.add(t.replace(/^#/, ''));
             });
-            const list = [...shown];
-            return { shown: list, missing: wanted.filter(w => !list.includes(w)) };
+            return {
+              added: wanted.filter(w => seen.has(w)),
+              missing: wanted.filter(w => !seen.has(w)),
+            };
           }, tags.slice(0, 10));
           console.log('タグ確認:', JSON.stringify(tagsApplied));
         } else {
