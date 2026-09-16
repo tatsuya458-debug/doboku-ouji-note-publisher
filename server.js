@@ -647,6 +647,234 @@ app.post('/set-paid', async (req, res) => {
 });
 
 // ============================================================
+// POST /inspect-publish … 既存下書きの「公開設定画面」を開いて構造を記録する（2026-09-16追加）
+// Body: { cookie, key, selectPaid?: true, price?: number }
+//
+// 2026-09-16に /publish が「投稿ボタンが見つかりません」で失敗したため、
+// 投稿ボタンの正体を推測せず実測するために追加。**何も投稿しない・下書きも作らない。**
+// selectPaid:true のときだけ「有料」ラジオを押して、そのあとの画面も記録する。
+// ============================================================
+app.post('/inspect-publish', async (req, res) => {
+  const cookie = String((req.body || {}).cookie || '');
+  const key = String((req.body || {}).key || '');
+  const selectPaid = !!(req.body || {}).selectPaid;
+  const price = Number((req.body || {}).price || 0);
+  if (!cookie || !key) return res.status(400).json({ success: false, error: 'cookie, key required' });
+  if (publishing) return res.status(429).json({ success: false, busy: true });
+  publishing = true;
+
+  // 押せそうな要素を、button に限らず全部拾う（前回 button だけ見て見落とした）
+  const dumpClickables = async (page, label) => await page.evaluate((lbl) => {
+    const rows = [];
+    document.querySelectorAll('button, a, input[type="submit"], input[type="button"], [role="button"], [role="menuitem"], [type="radio"]').forEach(el => {
+      const r = el.getBoundingClientRect();
+      const txt = (el.textContent || el.value || '').trim().slice(0, 28);
+      const aria = (el.getAttribute('aria-label') || '').slice(0, 28);
+      if (!txt && !aria && el.tagName !== 'INPUT') return;
+      rows.push([
+        el.tagName.toLowerCase(),
+        el.getAttribute('type') || '',
+        el.getAttribute('name') || '',
+        'txt="' + txt + '"',
+        aria ? 'aria="' + aria + '"' : '',
+        'vis=' + (r.width > 0 && r.height > 0),
+        'disabled=' + !!el.disabled,
+        'top=' + Math.round(r.top),
+        'cls=' + String(el.className || '').split(' ').slice(0, 2).join('.').slice(0, 40),
+      ].filter(Boolean).join(' '));
+    });
+    const dialog = [...document.querySelectorAll('[role="dialog"], [aria-modal="true"], .ReactModal__Content')]
+      .map(d => (d.textContent || '').trim().slice(0, 80));
+    return { label: lbl, url: location.href, count: rows.length, rows: rows.slice(0, 120), dialog };
+  }, label);
+
+  let browser;
+  try {
+    browser = await chromium.launch({ args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu', '--single-process'] });
+    const context = await browser.newContext({ userAgent: NOTE_UA, viewport: { width: 1280, height: 900 } });
+    const parsed = cookie.split('; ').map(c => { const i = c.indexOf('='); return { name: c.substring(0, i).trim(), value: c.substring(i + 1).trim(), path: '/' }; }).filter(c => c.name && c.value);
+    await context.addCookies([...parsed.map(c => ({ ...c, domain: '.note.com' })), ...parsed.map(c => ({ ...c, domain: 'editor.note.com' }))]);
+    const page = await context.newPage();
+
+    await page.goto('https://editor.note.com/notes/' + key + '/publish/', { waitUntil: 'domcontentloaded', timeout: 60000 });
+    await page.waitForTimeout(15000); // 販売設定画面は遅延レンダリング
+    if (page.url().includes('/login')) { await browser.close(); publishing = false; return res.json({ success: false, error: 'cookie expired' }); }
+
+    const shots = [];
+    shots.push(await dumpClickables(page, '1_publish_screen'));
+
+    // ページ末尾まで送ってから再取得（投稿ボタンが遅延描画される可能性）
+    await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
+    await page.waitForTimeout(3000);
+    shots.push(await dumpClickables(page, '2_after_scroll'));
+
+    if (selectPaid) {
+      const radio = await page.evaluate(() => {
+        const rs = [...document.querySelectorAll('input[name="is_paid"]')];
+        if (rs.length < 2) return { ok: false, reason: 'ラジオが見つからない(' + rs.length + ')' };
+        const target = rs[rs.length - 1];
+        target.scrollIntoView({ block: 'center' });
+        const lbl = target.closest('label') || document.querySelector('label[for="' + target.id + '"]');
+        (lbl || target).click();
+        return { ok: true, checked: target.checked };
+      });
+      await page.waitForTimeout(6000);
+      if (price > 0) {
+        await page.waitForSelector('input[id*="price"], input[placeholder="300"]', { timeout: 30000 }).catch(() => {});
+        const el = page.locator('input[id*="price"], input[name*="price"]').first();
+        if (await el.isVisible({ timeout: 3000 }).catch(() => false)) {
+          await el.click({ force: true }).catch(() => {});
+          await el.fill(String(price)).catch(() => {});
+          await page.waitForTimeout(2000);
+        }
+      }
+      await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
+      await page.waitForTimeout(2500);
+      const after = await dumpClickables(page, '3_after_paid' + (price > 0 ? '_price' : ''));
+      after.radio = radio;
+      shots.push(after);
+    }
+
+    await browser.close();
+    res.json(saveResult_({ success: true, key, shots }));
+  } catch (e) {
+    if (browser) await browser.close().catch(() => {});
+    res.status(500).json({ success: false, error: e.message });
+  } finally { publishing = false; }
+});
+
+// ============================================================
+// POST /delete-drafts … 検証用に溜まった下書きを削除する（2026-09-16追加）
+// Body: { cookie, keys: string[], confirm: true, inspectOnly?: true }
+//
+// 取り返しがつかない操作なので、安全側に倒してある：
+//   - keys で明示指定したものしか触らない（一括「全部消す」は用意しない）
+//   - 削除前にAPIで status を確認し、draft 以外（公開済み）は必ずスキップする
+//   - confirm:true が無いと実行しない
+//   - inspectOnly:true なら menu の中身を記録するだけで、クリックしない
+// ============================================================
+app.post('/delete-drafts', async (req, res) => {
+  const cookie = String((req.body || {}).cookie || '');
+  const keys = Array.isArray((req.body || {}).keys) ? (req.body || {}).keys.map(String).filter(Boolean) : [];
+  const inspectOnly = !!(req.body || {}).inspectOnly;
+  const confirm = !!(req.body || {}).confirm;
+  if (!cookie || !keys.length) return res.status(400).json({ success: false, error: 'cookie, keys required' });
+  if (!inspectOnly && !confirm) return res.status(400).json({ success: false, error: 'confirm:true required（削除は取り消せません）' });
+  if (keys.length > 20) return res.status(400).json({ success: false, error: 'keys は20件までにしてください' });
+  if (publishing) return res.status(429).json({ success: false, busy: true });
+  publishing = true;
+
+  let browser;
+  try {
+    browser = await chromium.launch({ args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu', '--single-process'] });
+    const context = await browser.newContext({ userAgent: NOTE_UA, viewport: { width: 1280, height: 900 } });
+    const parsed = cookie.split('; ').map(c => { const i = c.indexOf('='); return { name: c.substring(0, i).trim(), value: c.substring(i + 1).trim(), path: '/' }; }).filter(c => c.name && c.value);
+    await context.addCookies([...parsed.map(c => ({ ...c, domain: '.note.com' })), ...parsed.map(c => ({ ...c, domain: 'editor.note.com' }))]);
+    const page = await context.newPage();
+
+    await page.goto('https://note.com/notes', { waitUntil: 'domcontentloaded', timeout: 60000 });
+    await page.waitForTimeout(8000);
+    if (page.url().includes('/login')) { await browser.close(); publishing = false; return res.json({ success: false, error: 'cookie expired' }); }
+
+    // 記事一覧を取って key → {title, status} を作る。ここに無い／draftでないものは触らない。
+    const snapshot = async () => await page.evaluate(async () => {
+      try {
+        const r = await fetch('/api/v2/note_list/contents?limit=50&page=1', { credentials: 'include' });
+        const j = await r.json();
+        const list = (j && j.data && (j.data.contents || j.data.notes)) || [];
+        const map = {};
+        (Array.isArray(list) ? list : []).forEach(n => {
+          const k = n.key || n.id;
+          if (k) map[k] = { title: n.name || (n.noteDraft || {}).name || '', status: n.status };
+        });
+        return map;
+      } catch (e) { return { __error: e.message }; }
+    });
+
+    const before = await snapshot();
+    if (before.__error) { await browser.close(); publishing = false; return res.json({ success: false, error: '一覧取得失敗: ' + before.__error }); }
+
+    const results = [];
+    for (const key of keys) {
+      const meta = before[key];
+      if (!meta) { results.push({ key, skipped: '一覧に見つからない' }); continue; }
+      if (meta.status !== 'draft') { results.push({ key, title: meta.title, skipped: 'status=' + meta.status + '（公開済みは削除しない）' }); continue; }
+
+      try {
+        await page.goto('https://editor.note.com/notes/' + key + '/edit/', { waitUntil: 'domcontentloaded', timeout: 60000 });
+        await page.waitForTimeout(12000);
+
+        // 開いた記事が本当に指定のキーかを確認（URLが別記事に飛ばされていたら中止）
+        if (!page.url().includes(key)) { results.push({ key, title: meta.title, skipped: 'URLが一致しない: ' + page.url().slice(0, 80) }); continue; }
+
+        // 設定メニュー（…）を開く。文言ゆらぎに備えて候補を順に試し、開いた時点のボタンを全部記録する。
+        const menuSelectors = [
+          'button[aria-label*="設定"]', 'button[aria-label*="メニュー"]',
+          'button[aria-label*="その他"]', 'button[aria-label*="オプション"]',
+        ];
+        let menuOpened = null;
+        for (const sel of menuSelectors) {
+          const btn = page.locator(sel).last();
+          if (await btn.isVisible({ timeout: 2500 }).catch(() => false)) {
+            await btn.click({ force: true }).catch(() => {});
+            await page.waitForTimeout(2000);
+            menuOpened = sel;
+            break;
+          }
+        }
+
+        const menuItems = await page.evaluate(() =>
+          [...document.querySelectorAll('button, [role="menuitem"], a')]
+            .filter(b => b.offsetParent !== null)
+            .map(b => (b.textContent || '').trim())
+            .filter(t => t && t.length < 30)
+            .slice(0, 50)
+        );
+
+        if (inspectOnly) { results.push({ key, title: meta.title, menuOpened, menuItems, inspectOnly: true }); continue; }
+
+        // 「削除」をクリック → 確認ダイアログの「削除」をクリック
+        const hit = await page.evaluate(() => {
+          const els = [...document.querySelectorAll('button, [role="menuitem"], a')].filter(b => b.offsetParent !== null);
+          const el = els.find(b => /^(削除|削除する|下書きを削除)$/.test((b.textContent || '').trim()));
+          if (!el) return { ok: false };
+          el.click();
+          return { ok: true, text: (el.textContent || '').trim() };
+        });
+        if (!hit.ok) { results.push({ key, title: meta.title, skipped: '削除メニューが見つからない', menuOpened, menuItems }); continue; }
+        await page.waitForTimeout(2000);
+
+        const confirmed = await page.evaluate(() => {
+          const els = [...document.querySelectorAll('button, [role="button"]')].filter(b => b.offsetParent !== null);
+          // 確認ダイアログ側の「削除する」を押す。「キャンセル」は絶対に拾わない。
+          const el = els.find(b => /^(削除する|削除|はい|OK)$/.test((b.textContent || '').trim()));
+          if (!el) return { ok: false, visible: els.map(b => (b.textContent || '').trim()).filter(Boolean).slice(0, 20) };
+          el.click();
+          return { ok: true, text: (el.textContent || '').trim() };
+        });
+        await page.waitForTimeout(4000);
+        results.push({ key, title: meta.title, clicked: hit.text, confirmed });
+      } catch (e) {
+        results.push({ key, title: meta.title, error: e.message.slice(0, 100) });
+      }
+    }
+
+    // 実際に消えたかを一覧で確かめる（クリックできた＝消えた、とは限らないため）
+    await page.goto('https://note.com/notes', { waitUntil: 'domcontentloaded', timeout: 60000 }).catch(() => {});
+    await page.waitForTimeout(6000);
+    const after = await snapshot();
+    const verified = results.map(r => ({ ...r, deleted: !r.skipped && !after.__error ? !after[r.key] : null }));
+    const remaining = after.__error ? null : Object.keys(after).map(k => k + ' | ' + after[k].status + ' | ' + after[k].title.slice(0, 30));
+
+    await browser.close();
+    res.json(saveResult_({ success: true, inspectOnly, results: verified, remaining }));
+  } catch (e) {
+    if (browser) await browser.close().catch(() => {});
+    res.status(500).json({ success: false, error: e.message });
+  } finally { publishing = false; }
+});
+
+// ============================================================
 // POST /probe … note編集画面のUI構造を調査する診断用（投稿はしない）
 // 2026-08-21: UI変更で見出し画像の設定場所が消えたため、実画面から探すために追加
 // ============================================================
@@ -1599,11 +1827,28 @@ app.post('/publish', async (req, res) => {
     }
 
     if (!posted) {
-      const availableButtons = await page.evaluate(() =>
-        [...document.querySelectorAll('button')].map(b => b.textContent?.trim()).filter(Boolean).join(', ')
-      );
+      // 2026-09-16: button だけ見ていて原因が分からなかったので、押せる要素を全部＋設定の結果も返す
+      const diag = await page.evaluate(() => {
+        const rows = [];
+        document.querySelectorAll('button, a, input[type="submit"], [role="button"]').forEach(el => {
+          const r = el.getBoundingClientRect();
+          const txt = (el.textContent || el.value || '').trim().slice(0, 24);
+          const aria = (el.getAttribute('aria-label') || '').slice(0, 24);
+          if (!txt && !aria) return;
+          rows.push(el.tagName.toLowerCase() + ' "' + (txt || aria) + '" vis=' + (r.width > 0 && r.height > 0) + ' disabled=' + !!el.disabled + ' top=' + Math.round(r.top));
+        });
+        return {
+          url: location.href,
+          clickables: rows.slice(0, 80),
+          dialog: [...document.querySelectorAll('[role="dialog"], [aria-modal="true"]')].map(d => (d.textContent || '').trim().slice(0, 80)),
+        };
+      });
       await browser.close();
-      return res.json(saveResult_({ success: false, error: '投稿ボタンが見つかりません。利用可能なボタン: ' + availableButtons }));
+      if (thumbPath && existsSync(thumbPath)) { try { unlinkSync(thumbPath); } catch {} }
+      return res.json(saveResult_({
+        success: false, error: '投稿ボタンが見つかりません',
+        draftUrl: diag.url, diag, thumbnailSet, thumbDiag, pasteResult, tagsApplied, paidResult, newCookie: refreshedCookie,
+      }));
     }
 
     // ============================================================
