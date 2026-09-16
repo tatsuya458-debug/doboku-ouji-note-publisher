@@ -1080,27 +1080,35 @@ app.post('/delete-drafts', async (req, res) => {
       if (meta.status !== 'draft') { results.push({ key, title: meta.title, skipped: 'status=' + meta.status + '（公開済みは削除しない）' }); continue; }
 
       try {
-        await page.goto('https://editor.note.com/notes/' + key + '/edit/', { waitUntil: 'domcontentloaded', timeout: 60000 });
-        await page.waitForTimeout(12000);
+        // 2026-09-16実測：編集画面の「メニューを開く」はブロック挿入用（＋メニュー）で削除は無い。
+        // 削除は記事一覧（note.com/notes）の、カードごとの「…」メニューにある。
+        await page.goto('https://note.com/notes', { waitUntil: 'domcontentloaded', timeout: 60000 });
+        await page.waitForTimeout(9000);
 
-        // 開いた記事が本当に指定のキーかを確認（URLが別記事に飛ばされていたら中止）
-        if (!page.url().includes(key)) { results.push({ key, title: meta.title, skipped: 'URLが一致しない: ' + page.url().slice(0, 80) }); continue; }
-
-        // 設定メニュー（…）を開く。文言ゆらぎに備えて候補を順に試し、開いた時点のボタンを全部記録する。
-        const menuSelectors = [
-          'button[aria-label*="設定"]', 'button[aria-label*="メニュー"]',
-          'button[aria-label*="その他"]', 'button[aria-label*="オプション"]',
-        ];
-        let menuOpened = null;
-        for (const sel of menuSelectors) {
-          const btn = page.locator(sel).last();
-          if (await btn.isVisible({ timeout: 2500 }).catch(() => false)) {
-            await btn.click({ force: true }).catch(() => {});
-            await page.waitForTimeout(2000);
-            menuOpened = sel;
-            break;
+        // 対象のカードを key へのリンクから特定し、その中の「…」ボタンだけを押す。
+        // 別のカードのメニューを開いて誤爆しないよう、必ずカード内に限定する。
+        const openMenu = await page.evaluate((k) => {
+          const link = [...document.querySelectorAll('a[href*="' + k + '"]')][0];
+          if (!link) return { ok: false, reason: 'カードが見つからない' };
+          let card = link;
+          for (let i = 0; i < 8 && card.parentElement; i++) {
+            card = card.parentElement;
+            if (card.querySelector('button')) break;
           }
-        }
+          const btns = [...card.querySelectorAll('button')];
+          if (!btns.length) return { ok: false, reason: 'カード内にボタンが無い' };
+          // 「…」はテキストを持たず aria-label で表される
+          const kebab = btns.find(b => /メニュー|その他|オプション|設定/.test(b.getAttribute('aria-label') || '')) || btns[btns.length - 1];
+          kebab.scrollIntoView({ block: 'center' });
+          kebab.click();
+          return {
+            ok: true,
+            aria: kebab.getAttribute('aria-label') || '(なし)',
+            cardButtons: btns.map(b => (b.getAttribute('aria-label') || (b.textContent || '').trim() || '(無名)').slice(0, 20)),
+          };
+        }, key);
+        if (!openMenu.ok) { results.push({ key, title: meta.title, skipped: openMenu.reason }); continue; }
+        await page.waitForTimeout(2500);
 
         const menuItems = await page.evaluate(() =>
           [...document.querySelectorAll('button, [role="menuitem"], a')]
@@ -1110,7 +1118,7 @@ app.post('/delete-drafts', async (req, res) => {
             .slice(0, 50)
         );
 
-        if (inspectOnly) { results.push({ key, title: meta.title, menuOpened, menuItems, inspectOnly: true }); continue; }
+        if (inspectOnly) { results.push({ key, title: meta.title, openMenu, menuItems, inspectOnly: true }); continue; }
 
         // 「削除」をクリック → 確認ダイアログの「削除」をクリック
         const hit = await page.evaluate(() => {
@@ -1120,7 +1128,7 @@ app.post('/delete-drafts', async (req, res) => {
           el.click();
           return { ok: true, text: (el.textContent || '').trim() };
         });
-        if (!hit.ok) { results.push({ key, title: meta.title, skipped: '削除メニューが見つからない', menuOpened, menuItems }); continue; }
+        if (!hit.ok) { results.push({ key, title: meta.title, skipped: '削除メニューが見つからない', openMenu, menuItems }); continue; }
         await page.waitForTimeout(2000);
 
         const confirmed = await page.evaluate(() => {
