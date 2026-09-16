@@ -1084,9 +1084,22 @@ app.post('/delete-drafts', async (req, res) => {
           .map(x => (x.getAttribute('aria-label') || (x.textContent || '').trim()).slice(0, 24))
           .filter(Boolean).slice(0, 30),
         anchorCount: document.querySelectorAll('a').length,
-        noteHrefs: [...document.querySelectorAll('a')].map(a => a.getAttribute('href') || '')
-          .filter(h => /\/n[0-9a-f]{8,}/.test(h) || h.indexOf('/notes/') >= 0).slice(0, 20),
-        bodyText: (document.body.innerText || '').replace(/\s+/g, ' ').slice(0, 700),
+        allHrefs: [...document.querySelectorAll('a')].map(a => a.getAttribute('href') || '').filter(Boolean),
+        // 「〜を編集」の要素が下書きカードの入口。タグ・href・カード内のボタンまで見る
+        editEntries: [...document.querySelectorAll('[aria-label*="を編集"]')].map(el => {
+          let card = el;
+          for (let i = 0; i < 8 && card.parentElement; i++) {
+            card = card.parentElement;
+            if (card.querySelectorAll('button').length >= 1 && (card.textContent || '').indexOf('下書き') >= 0) break;
+          }
+          return {
+            tag: el.tagName.toLowerCase(),
+            href: el.getAttribute('href') || '(なし)',
+            aria: (el.getAttribute('aria-label') || '').slice(0, 30),
+            cardHrefs: [...card.querySelectorAll('a')].map(a => a.getAttribute('href') || '').filter(Boolean).slice(0, 5),
+            cardButtons: [...card.querySelectorAll('button')].map(b => (b.getAttribute('aria-label') || (b.textContent || '').trim() || '(無名)').slice(0, 24)).slice(0, 8),
+          };
+        }).slice(0, 12),
       }));
     }
 
