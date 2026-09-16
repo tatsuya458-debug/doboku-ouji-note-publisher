@@ -699,6 +699,7 @@ app.post('/publish-existing', async (req, res) => {
 
     // --- 2. ハッシュタグ（任意）---
     let tagsApplied = null;
+    const tagTrace = [];   // 1タグごとに「入力欄に入ったか／Enterで消えたか」を残す
     if (tags.length) {
       try {
         const nav = page.locator('button:has-text("ハッシュタグ")').first();
@@ -707,12 +708,15 @@ app.post('/publish-existing', async (req, res) => {
         if (await input.isVisible({ timeout: 5000 }).catch(() => false)) {
           for (const t of tags.slice(0, 10)) {
             // fill() だと値は入るがReactに伝わらず、Enterで確定されない（2026-09-16実測）。
-            // 実際のキー入力にする。
+            // 実際のキー入力にする。効いているか毎回そのつど読む。
             await input.click({ force: true });
             await page.keyboard.type(t, { delay: 60 });
             await page.waitForTimeout(900);
+            const typed = await input.inputValue().catch(() => '(読めない)');
             await page.keyboard.press('Enter');
-            await page.waitForTimeout(900);
+            await page.waitForTimeout(1200);
+            const afterEnter = await input.inputValue().catch(() => '(読めない)');
+            tagTrace.push({ tag: t, typed, afterEnter });
           }
           await page.waitForTimeout(1500);
           tagsApplied = await page.evaluate((wanted) => {
@@ -729,7 +733,7 @@ app.post('/publish-existing', async (req, res) => {
           tagsApplied = { error: 'タグ入力欄が見つかりません' };
         }
       } catch (e) { tagsApplied = { error: e.message.slice(0, 80) }; }
-      steps.push({ step: '2_tags', tagsApplied });
+      steps.push({ step: '2_tags', tagsApplied, tagTrace });
     }
 
     // --- 3. 有料を選んで価格を入れる ---
@@ -797,6 +801,9 @@ app.post('/publish-existing', async (req, res) => {
         // 押す前に「選んだ位置の直後にくる文字」を控える。
         // ボタンは各ブロックの兄弟ではなくラッパー内にあるので、兄弟だけ見ると取れない（2026-09-16）。
         // DOM順で後ろに進み、最初に出てくる文字を持つ末端要素を拾う。
+        // 本文ではないUIラベルは読み飛ばす（実測で判明・2026-09-16）
+        const CHROME = [LABEL, 'このラインより先を有料にする', 'ここから先は有料エリアです'];
+        const isChrome = (t) => CHROME.some(c => t === c || t.indexOf(c) >= 0);
         const all = [...document.querySelectorAll('*')];
         const bi = all.indexOf(best);
         let nextText = '(なし)';
@@ -805,14 +812,14 @@ app.post('/publish-existing', async (req, res) => {
           const el = all[i];
           if (el.childElementCount !== 0) continue;
           const t = (el.textContent || '').trim();
-          if (!t || t === LABEL) continue;
+          if (!t || isChrome(t)) continue;
           nextText = t.slice(0, 40); break;
         }
         for (let i = bi - 1; i >= 0 && i > bi - 400; i--) {
           const el = all[i];
           if (el.childElementCount !== 0) continue;
           const t = (el.textContent || '').trim();
-          if (!t || t === LABEL) continue;
+          if (!t || isChrome(t)) continue;
           prevText = t.slice(-40); break;
         }
         // 直後がアンカー行でなければ押さない（位置がずれた状態で公開しないため）
