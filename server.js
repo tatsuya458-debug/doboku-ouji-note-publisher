@@ -647,6 +647,177 @@ app.post('/set-paid', async (req, res) => {
 });
 
 // ============================================================
+// POST /edit-text … 既存記事の本文を「文字列の置換」だけで直す（2026-09-17追加）
+// Body: { cookie, key, ops:[{find,replace}], context?:[str], dump?:bool, confirm, dryRun }
+//
+// 公開中・販売中の記事を機械で編集するため、安全側に倒してある：
+//   - dryRun（既定）は**一切打鍵せず**、対象が一意に見つかるかだけを確かめる
+//   - find が0件または2件以上なら、その時点で中止（どこを直すか曖昧なまま触らない）
+//   - 置換は Range で対象だけを選択 → 実キー入力。React/エディタに正しく伝わる
+//   - 1件ごとに、置換後のブロックを読み返して replace があり find が消えたことを照合。
+//     1件でも失敗したら**保存せずに中止**する（＝公開中の本文は元のまま）
+//   - 保存（更新する）は confirm:true のときだけ押す
+// ============================================================
+app.post('/edit-text', async (req, res) => {
+  const b = req.body || {};
+  const cookie = String(b.cookie || '');
+  const key = String(b.key || '');
+  const ops = Array.isArray(b.ops) ? b.ops : [];
+  const context = Array.isArray(b.context) ? b.context : [];
+  const dryRun = b.dryRun !== false;   // 既定は dryRun。明示的に false にしない限り打鍵しない
+  if (!cookie || !key) return res.status(400).json({ success: false, error: 'cookie, key required' });
+  if (!ops.length && !context.length && !b.dump) return res.status(400).json({ success: false, error: 'ops か context か dump が必要です' });
+  if (!dryRun && !b.confirm) return res.status(400).json({ success: false, error: 'confirm:true required（公開中の記事を書き換えます）' });
+  if (publishing) return res.status(429).json({ success: false, busy: true });
+  publishing = true;
+
+  const steps = [];
+  let browser;
+  try {
+    browser = await chromium.launch({ args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu', '--single-process'] });
+    const ctx = await browser.newContext({ userAgent: NOTE_UA, viewport: { width: 1280, height: 900 } });
+    const parsed = cookie.split('; ').map(c => { const i = c.indexOf('='); return { name: c.substring(0, i).trim(), value: c.substring(i + 1).trim(), path: '/' }; }).filter(c => c.name && c.value);
+    await ctx.addCookies([...parsed.map(c => ({ ...c, domain: '.note.com' })), ...parsed.map(c => ({ ...c, domain: 'editor.note.com' }))]);
+    const page = await ctx.newPage();
+
+    await page.goto('https://editor.note.com/notes/' + key + '/edit/', { waitUntil: 'domcontentloaded', timeout: 60000 });
+    await page.waitForTimeout(18000);   // 20万字の本文は描画が遅い
+    if (page.url().includes('/login')) { await browser.close(); publishing = false; return res.json({ success: false, error: 'cookie expired' }); }
+
+    const editorInfo = await page.evaluate(() => {
+      const root = document.querySelector('[contenteditable="true"]');
+      return {
+        found: !!root,
+        textLen: root ? (root.innerText || '').length : 0,
+        topButtons: [...document.querySelectorAll('button')]
+          .filter(x => { const r = x.getBoundingClientRect(); return r.top >= 0 && r.top < 70 && r.width > 0; })
+          .map(x => (x.textContent || '').trim()).filter(Boolean),
+      };
+    });
+    steps.push({ step: '1_open', editorInfo });
+    if (!editorInfo.found) { await browser.close(); publishing = false; return res.json({ success: false, error: '本文エディタが見つかりません', steps }); }
+
+    // context: 指定文字列の前後を見せる（どう変換されているか実物を確認するため）
+    if (context.length || b.dump) {
+      const seen = await page.evaluate((args) => {
+        const root = document.querySelector('[contenteditable="true"]');
+        const all = root.innerText || '';
+        const out = {};
+        (args.context || []).forEach(s => {
+          const i = all.indexOf(s);
+          out[s] = i < 0 ? '(見つからない)' : all.slice(Math.max(0, i - 120), i + 160).replace(/\n/g, ' ⏎ ');
+        });
+        return { context: out, head: args.dump ? all.slice(0, 1500) : undefined };
+      }, { context, dump: !!b.dump });
+      steps.push({ step: '2_context', ...seen });
+    }
+
+    // ops: まず全件について「一意に見つかるか」だけを先に確かめる（打鍵する前に）
+    const locate = await page.evaluate((list) => {
+      const root = document.querySelector('[contenteditable="true"]');
+      const all = root.innerText || '';
+      return list.map(o => {
+        let n = 0, from = 0, i;
+        while ((i = all.indexOf(o.find, from)) >= 0) { n++; from = i + 1; if (n > 5) break; }
+        return { find: o.find, count: n };
+      });
+    }, ops.map(o => ({ find: String(o.find || '') })));
+    steps.push({ step: '3_locate', locate });
+
+    const bad = locate.filter(x => x.count !== 1);
+    if (bad.length) {
+      await browser.close(); publishing = false;
+      return res.json(saveResult_({ success: false, error: '対象が一意に決まりません（0件または複数件）', bad, steps }));
+    }
+
+    if (dryRun) {
+      await browser.close(); publishing = false;
+      return res.json(saveResult_({ success: true, dryRun: true, message: '対象を一意に特定できました（打鍵していません）', steps }));
+    }
+
+    // 実際の置換：Rangeで対象だけを選択して実キー入力で打ち替える
+    const applied = [];
+    for (const op of ops) {
+      const find = String(op.find || '');
+      const replace = String(op.replace || '');
+
+      const sel = await page.evaluate((f) => {
+        const root = document.querySelector('[contenteditable="true"]');
+        const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+        let node, hit = null, idx = -1;
+        while ((node = walker.nextNode())) {
+          const i = (node.nodeValue || '').indexOf(f);
+          if (i >= 0) { hit = node; idx = i; break; }
+        }
+        // 単一テキストノードに収まっていない場合は触らない（装飾で分割されている等）
+        if (!hit) return { ok: false, reason: '単一のテキストノードとして見つからない' };
+        const block = hit.parentElement.closest('h1,h2,h3,p,li') || hit.parentElement;
+        block.scrollIntoView({ block: 'center' });
+        const range = document.createRange();
+        range.setStart(hit, idx);
+        range.setEnd(hit, idx + f.length);
+        const s = window.getSelection();
+        s.removeAllRanges(); s.addRange(range);
+        return { ok: true, selected: s.toString(), blockBefore: (block.textContent || '').slice(0, 100) };
+      }, find);
+
+      if (!sel.ok || sel.selected !== find) {
+        applied.push({ find, ok: false, reason: sel.reason || ('選択がズレた: "' + sel.selected + '"') });
+        break;
+      }
+
+      await page.waitForTimeout(400);
+      await page.keyboard.type(replace, { delay: 35 });
+      await page.waitForTimeout(1200);
+
+      // 読み返して照合：replaceが入り、findが消えたか
+      const verify = await page.evaluate((args) => {
+        const root = document.querySelector('[contenteditable="true"]');
+        const all = root.innerText || '';
+        return { hasReplace: all.indexOf(args.replace) >= 0, findLeft: all.indexOf(args.find) >= 0 };
+      }, { find, replace });
+
+      const ok = verify.hasReplace && !verify.findLeft;
+      applied.push({ find, replace, ok, verify, blockBefore: sel.blockBefore });
+      if (!ok) break;
+    }
+    steps.push({ step: '4_apply', applied });
+
+    const allOk = applied.length === ops.length && applied.every(a => a.ok);
+    if (!allOk) {
+      // 保存しない＝公開中の本文は元のまま。ページを閉じるだけ
+      await browser.close(); publishing = false;
+      return res.json(saveResult_({ success: false, error: '置換に失敗したため保存せずに中止しました（記事は元のままです）', steps }));
+    }
+
+    // 保存（更新する／公開する）
+    const saved = await page.evaluate(() => {
+      const el = [...document.querySelectorAll('button')]
+        .filter(x => { const r = x.getBoundingClientRect(); return r.top >= 0 && r.top < 70 && r.width > 0; })
+        .find(x => /更新する|公開に進む|保存/.test((x.textContent || '').trim()));
+      if (!el) return { ok: false, visible: [...document.querySelectorAll('button')].map(x => (x.textContent || '').trim()).filter(Boolean).slice(0, 20) };
+      el.click(); return { ok: true, text: (el.textContent || '').trim() };
+    });
+    await page.waitForTimeout(6000);
+    // 「更新する」が確認画面を挟む場合に備える
+    const confirmBtn = await page.evaluate(() => {
+      const el = [...document.querySelectorAll('button')].filter(x => x.offsetParent !== null)
+        .find(x => /^(更新する|公開する|投稿する)$/.test((x.textContent || '').trim()));
+      if (!el) return { needed: false };
+      el.click(); return { needed: true, text: (el.textContent || '').trim() };
+    });
+    await page.waitForTimeout(8000);
+    steps.push({ step: '5_save', saved, confirmBtn, url: page.url() });
+
+    await browser.close();
+    res.json(saveResult_({ success: saved.ok, steps }));
+  } catch (e) {
+    if (browser) await browser.close().catch(() => {});
+    res.status(500).json({ success: false, error: e.message, steps });
+  } finally { publishing = false; }
+});
+
+// ============================================================
 // POST /publish-existing … 既存の下書きを、noteの正規フローで有料公開する（2026-09-16追加）
 // Body: { cookie, key, price, tags?, paidAnchor, confirm, dryRun? }
 //
