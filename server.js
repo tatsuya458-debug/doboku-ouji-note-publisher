@@ -730,6 +730,35 @@ app.post('/edit-text', async (req, res) => {
       return res.json(saveResult_({ success: false, error: '対象が一意に決まりません（0件または複数件）', bad, steps }));
     }
 
+    // inspectSave: 打鍵せずに「公開に進む」だけ押して、保存画面の状態を確かめる。
+    // 2026-09-17: 公開中の記事の編集画面が「更新する」ではなく「公開に進む」だったため、
+    // 有料エリアと価格が保持されるかを、本文を触る前に確認する。
+    if (dryRun && b.inspectSave) {
+      const went = await page.evaluate(() => {
+        const el = [...document.querySelectorAll('button')]
+          .filter(x => { const r = x.getBoundingClientRect(); return r.top >= 0 && r.top < 70 && r.width > 0; })
+          .find(x => /公開に進む|更新する/.test((x.textContent || '').trim()));
+        if (!el) return { ok: false };
+        el.click(); return { ok: true, text: (el.textContent || '').trim() };
+      });
+      await page.waitForTimeout(16000);   // 販売設定画面は遅延レンダリング
+      const saveScreen = await page.evaluate(() => {
+        const paid = [...document.querySelectorAll('input[name="is_paid"]')].find(r => r.checked);
+        const price = document.querySelector('input[id*="price"], input[name*="price"]');
+        return {
+          url: location.href,
+          topButtons: [...document.querySelectorAll('button')]
+            .filter(x => { const r = x.getBoundingClientRect(); return r.top >= 0 && r.top < 70 && r.width > 0; })
+            .map(x => (x.textContent || '').trim()).filter(Boolean),
+          isPaid: paid ? paid.value : '(未選択)',
+          priceValue: price ? price.value : '(欄なし)',
+        };
+      });
+      steps.push({ step: '3b_inspect_save', went, saveScreen });
+      await browser.close(); publishing = false;
+      return res.json(saveResult_({ success: true, dryRun: true, message: '保存画面の状態を確認（本文は触っていません・保存もしていません）', steps }));
+    }
+
     if (dryRun) {
       await browser.close(); publishing = false;
       return res.json(saveResult_({ success: true, dryRun: true, message: '対象を一意に特定できました（打鍵していません）', steps }));
@@ -790,27 +819,57 @@ app.post('/edit-text', async (req, res) => {
       return res.json(saveResult_({ success: false, error: '置換に失敗したため保存せずに中止しました（記事は元のままです）', steps }));
     }
 
-    // 保存（更新する／公開する）
-    const saved = await page.evaluate(() => {
+    // 保存：公開中の記事は「更新する」ではなく「公開に進む」で販売設定画面へ行く（2026-09-17実測）
+    const topCta = async () => await page.evaluate(() =>
+      [...document.querySelectorAll('button')]
+        .filter(x => { const r = x.getBoundingClientRect(); return r.top >= 0 && r.top < 70 && r.width > 0; })
+        .map(x => (x.textContent || '').trim()).filter(Boolean));
+
+    const went = await page.evaluate(() => {
       const el = [...document.querySelectorAll('button')]
         .filter(x => { const r = x.getBoundingClientRect(); return r.top >= 0 && r.top < 70 && r.width > 0; })
-        .find(x => /更新する|公開に進む|保存/.test((x.textContent || '').trim()));
+        .find(x => /公開に進む|更新する/.test((x.textContent || '').trim()));
       if (!el) return { ok: false, visible: [...document.querySelectorAll('button')].map(x => (x.textContent || '').trim()).filter(Boolean).slice(0, 20) };
       el.click(); return { ok: true, text: (el.textContent || '').trim() };
     });
-    await page.waitForTimeout(6000);
-    // 「更新する」が確認画面を挟む場合に備える
-    const confirmBtn = await page.evaluate(() => {
-      const el = [...document.querySelectorAll('button')].filter(x => x.offsetParent !== null)
-        .find(x => /^(更新する|公開する|投稿する)$/.test((x.textContent || '').trim()));
-      if (!el) return { needed: false };
-      el.click(); return { needed: true, text: (el.textContent || '').trim() };
+    if (!went.ok) {
+      await browser.close(); publishing = false;
+      return res.json(saveResult_({ success: false, error: '保存に進むボタンが見つかりません（本文は保存されていません）', went, steps }));
+    }
+
+    // 販売設定画面は遅延レンダリング。確定ボタンが出るまで待つ
+    await page.waitForFunction(() =>
+      [...document.querySelectorAll('button')]
+        .filter(x => { const r = x.getBoundingClientRect(); return r.top >= 0 && r.top < 70 && r.width > 0; })
+        .some(x => /^(更新する|投稿する|公開する)$/.test((x.textContent || '').trim())),
+      { timeout: 40000 }).catch(() => {});
+
+    // 押す前に、有料設定が保持されているかを確認する。崩れていたら押さない。
+    const before = await page.evaluate(() => {
+      const paid = [...document.querySelectorAll('input[name="is_paid"]')].find(r => r.checked);
+      const price = document.querySelector('input[id*="price"], input[name*="price"]');
+      return { isPaid: paid ? paid.value : '(未選択)', priceValue: price ? price.value : '(欄なし)' };
     });
-    await page.waitForTimeout(8000);
-    steps.push({ step: '5_save', saved, confirmBtn, url: page.url() });
+    const cta = await topCta();
+    steps.push({ step: '5_save_screen', went, cta, before });
+
+    if (before.isPaid !== 'paid' || before.priceValue !== String(b.expectPrice || before.priceValue)) {
+      await browser.close(); publishing = false;
+      return res.json(saveResult_({ success: false, error: '販売設定が想定と違うため保存しませんでした（記事は元のままです）', before, steps }));
+    }
+
+    const confirmBtn = await page.evaluate(() => {
+      const el = [...document.querySelectorAll('button')]
+        .filter(x => { const r = x.getBoundingClientRect(); return r.top >= 0 && r.top < 70 && r.width > 0; })
+        .find(x => /^(更新する|投稿する|公開する)$/.test((x.textContent || '').trim()));
+      if (!el) return { ok: false };
+      el.click(); return { ok: true, text: (el.textContent || '').trim() };
+    });
+    await page.waitForTimeout(10000);
+    steps.push({ step: '6_saved', confirmBtn, url: page.url() });
 
     await browser.close();
-    res.json(saveResult_({ success: saved.ok, steps }));
+    res.json(saveResult_({ success: !!confirmBtn.ok, steps }));
   } catch (e) {
     if (browser) await browser.close().catch(() => {});
     res.status(500).json({ success: false, error: e.message, steps });
