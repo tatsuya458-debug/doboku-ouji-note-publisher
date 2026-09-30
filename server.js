@@ -1101,7 +1101,7 @@ app.post('/replace-body', async (req, res) => {
       const out = [];
       let prev = '';
       for (const k of kids) {
-        if (k.tagName === 'FIGURE') { out.push(prev); continue; }
+        if (k.tagName === 'FIGURE' && !k.querySelector('blockquote')) { out.push(prev); continue; }   // noteは引用もfigureで囲む
         const t = (k.innerText || '').trim().split('\n').filter(Boolean).pop() || '';
         if (t) prev = t;
       }
