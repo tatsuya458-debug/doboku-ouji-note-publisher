@@ -877,6 +877,243 @@ app.post('/edit-text', async (req, res) => {
 });
 
 // ============================================================
+// POST /replace-body … 公開中の記事のタイトルと本文を丸ごと入れ替える（2026-09-30追加）
+// Body: { cookie, key, title, body(md・タイトル行なし), paidAnchor, expectPrice,
+//         tocBefore?, mustContain?:[str], mustNotContain?:[str], dryRun(既定true), confirm }
+//
+// 有料note初号をv2に差し替えるために追加。/edit-text と同じく安全側に倒す：
+//   - 編集画面での変更は「公開に進む→更新する」を押すまで公開中の記事に出ない。
+//     途中で1つでも確認に失敗したら、押さずに閉じる（＝公開中の本文は元のまま）
+//   - 本文は全選択して mdToNoteHtml_ のHTMLを貼り付ける（/publish の paste と同じ方式）
+//   - 貼り付け後、mustContain が全部あり mustNotContain が1つも無いことを読み返して照合
+//   - 本文を入れ替えると有料ラインの位置が失われるので、公開設定画面で paidAnchor の直前に引き直す
+//   - 押す前に「有料」「expectPrice」を読み返し、違えば押さない
+//   - dryRun は最後の「更新する」だけ押さずに止める
+// ============================================================
+app.post('/replace-body', async (req, res) => {
+  const b = req.body || {};
+  const cookie = String(b.cookie || '');
+  const key = String(b.key || '');
+  const title = String(b.title || '');
+  const body = String(b.body || '');
+  const paidAnchor = String(b.paidAnchor || '');
+  const expectPrice = String(b.expectPrice || '');
+  const tocBefore = String(b.tocBefore || '');
+  const mustContain = Array.isArray(b.mustContain) ? b.mustContain.map(String) : [];
+  const mustNotContain = Array.isArray(b.mustNotContain) ? b.mustNotContain.map(String) : [];
+  const dryRun = b.dryRun !== false;
+  if (!cookie || !key || !title || !body || !paidAnchor || !expectPrice) {
+    return res.status(400).json({ success: false, error: 'cookie, key, title, body, paidAnchor, expectPrice required' });
+  }
+  if (!dryRun && !b.confirm) return res.status(400).json({ success: false, error: 'confirm:true required（公開中の記事を書き換えます）' });
+  if (publishing) return res.status(429).json({ success: false, busy: true });
+  publishing = true;
+
+  const steps = [];
+  let browser;
+  const abort = async (error, extra = {}) => {
+    if (browser) await browser.close().catch(() => {});
+    publishing = false;
+    return res.json(saveResult_({ success: false, error: error + '（更新は押していません。公開中の記事は元のままです）', ...extra, steps }));
+  };
+  try {
+    browser = await chromium.launch({ args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu', '--single-process'] });
+    const ctx = await browser.newContext({ userAgent: NOTE_UA, viewport: { width: 1280, height: 900 } });
+    const parsed = cookie.split('; ').map(c => { const i = c.indexOf('='); return { name: c.substring(0, i).trim(), value: c.substring(i + 1).trim(), path: '/' }; }).filter(c => c.name && c.value);
+    await ctx.addCookies([...parsed.map(c => ({ ...c, domain: '.note.com' })), ...parsed.map(c => ({ ...c, domain: 'editor.note.com' }))]);
+    const page = await ctx.newPage();
+
+    const topCta = async () => await page.evaluate(() =>
+      [...document.querySelectorAll('button')]
+        .filter(x => { const r = x.getBoundingClientRect(); return r.top >= 0 && r.top < 70 && r.width > 0; })
+        .map(x => (x.textContent || '').trim()).filter(Boolean));
+
+    // --- 1. 編集画面を開く ---
+    await page.goto('https://editor.note.com/notes/' + key + '/edit/', { waitUntil: 'domcontentloaded', timeout: 60000 });
+    await page.waitForTimeout(18000);
+    if (page.url().includes('/login')) return abort('cookie expired');
+    await dismissModals(page);
+    const bodySel = 'div.ProseMirror[contenteditable="true"], div[contenteditable="true"][role="textbox"]';
+    const before = await page.evaluate((sel) => {
+      const el = document.querySelector(sel);
+      return { found: !!el, textLen: el ? (el.innerText || '').length : 0 };
+    }, bodySel);
+    steps.push({ step: '1_open', before, cta: await topCta() });
+    if (!before.found) return abort('本文エディタが見つかりません');
+
+    // --- 2. タイトル ---
+    const titleSel = 'textarea[placeholder*="タイトル"]';
+    const titleOk = await page.locator(titleSel).first().isVisible({ timeout: 5000 }).catch(() => false);
+    if (!titleOk) return abort('タイトル欄が見つかりません');
+    await page.fill(titleSel, title);
+    await page.waitForTimeout(800);
+    const titleNow = await page.locator(titleSel).first().inputValue().catch(() => '');
+    steps.push({ step: '2_title', titleNow });
+    if (titleNow !== title) return abort('タイトルが入りませんでした');
+
+    // --- 3. 本文を全選択して貼り付け ---
+    await page.locator(bodySel).first().click({ force: true });
+    await page.waitForTimeout(500);
+    await page.keyboard.press('Control+a');
+    await page.waitForTimeout(800);
+    const html = mdToNoteHtml_(body);
+    const pasted = await page.evaluate((args) => {
+      const el = document.querySelector(args.sel);
+      el.focus();
+      const dt = new DataTransfer();
+      dt.setData('text/html', args.h);
+      dt.setData('text/plain', ' ');
+      const ev = new ClipboardEvent('paste', { clipboardData: dt, bubbles: true, cancelable: true });
+      el.dispatchEvent(ev);
+      return { handled: ev.defaultPrevented, htmlLen: args.h.length };
+    }, { sel: bodySel, h: html });
+    await page.waitForTimeout(8000);
+    const check = await page.evaluate((args) => {
+      const all = document.querySelector(args.sel).innerText || '';
+      return {
+        textLen: all.length,
+        head: all.slice(0, 80),
+        tail: all.slice(-80),
+        missing: args.must.filter(s => all.indexOf(s) < 0),
+        leftover: args.mustNot.filter(s => all.indexOf(s) >= 0),
+      };
+    }, { sel: bodySel, must: mustContain, mustNot: mustNotContain });
+    steps.push({ step: '3_paste', pasted, check });
+    if (!pasted.handled) return abort('貼り付けがエディタに受け付けられませんでした');
+    if (check.missing.length || check.leftover.length) return abort('貼り付け後の本文が想定と違います');
+
+    // --- 4. 目次（任意）：tocBefore の見出しの直前の空行に＋メニューから入れる ---
+    if (tocBefore) {
+      const placed = await page.evaluate((args) => {
+        const root = document.querySelector(args.sel);
+        const h = [...root.querySelectorAll('h2,h3')].find(x => (x.textContent || '').trim().startsWith(args.t));
+        if (!h) return { ok: false, reason: '見出しが見つからない' };
+        const prev = h.previousElementSibling;
+        if (!prev || prev.tagName !== 'P' || (prev.textContent || '').trim() !== '') return { ok: false, reason: '直前が空行ではない', prevTag: prev && prev.tagName };
+        prev.scrollIntoView({ block: 'center' });
+        const range = document.createRange(); range.setStart(prev, 0); range.collapse(true);
+        const s = window.getSelection(); s.removeAllRanges(); s.addRange(range);
+        return { ok: true };
+      }, { sel: bodySel, t: tocBefore });
+      let toc = { placed };
+      if (placed.ok) {
+        await page.waitForTimeout(1200);
+        const plusBtn = page.locator('button[aria-label="メニューを開く"]').first();
+        if (await plusBtn.isVisible({ timeout: 4000 }).catch(() => false)) {
+          await plusBtn.click({ force: true });
+          await page.waitForTimeout(1500);
+          toc.menu = await page.evaluate(() => {
+            const vis = [...document.querySelectorAll('button')].filter(x => x.offsetParent !== null);
+            const btn = vis.find(x => (x.textContent || '').trim() === '目次');
+            const items = vis.map(x => (x.textContent || '').trim()).filter(Boolean).slice(0, 40);
+            if (btn) { btn.click(); return { clicked: true, items }; }
+            return { clicked: false, items };
+          });
+          await page.waitForTimeout(3000);
+          if (!toc.menu.clicked) await page.keyboard.press('Escape');
+        } else toc.menu = { clicked: false, reason: '＋ボタンが出ない' };
+      }
+      // 目次で本文が壊れていないか読み返す
+      toc.after = await page.evaluate((args) => {
+        const all = document.querySelector(args.sel).innerText || '';
+        return { textLen: all.length, missing: args.must.filter(s => all.indexOf(s) < 0) };
+      }, { sel: bodySel, must: mustContain });
+      steps.push({ step: '4_toc', toc });
+      if (toc.after.missing.length) return abort('目次の挿入後に本文が欠けました');
+    }
+    await page.waitForTimeout(4000);   // 自動保存
+
+    // --- 5. 公開に進む → 販売設定画面 ---
+    const went = await page.evaluate(() => {
+      const el = [...document.querySelectorAll('button')]
+        .filter(x => { const r = x.getBoundingClientRect(); return r.top >= 0 && r.top < 70 && r.width > 0; })
+        .find(x => /公開に進む|更新する/.test((x.textContent || '').trim()));
+      if (!el) return { ok: false };
+      el.click(); return { ok: true, text: (el.textContent || '').trim() };
+    });
+    if (!went.ok) return abort('「公開に進む」が見つかりません');
+    await page.waitForTimeout(16000);
+    const saleState = async () => await page.evaluate(() => {
+      const paid = [...document.querySelectorAll('input[name="is_paid"]')].find(r => r.checked);
+      const price = document.querySelector('input[id*="price"], input[name*="price"]');
+      return { isPaid: paid ? paid.value : '(未選択)', priceValue: price ? price.value : '(欄なし)' };
+    });
+    const sale1 = await saleState();
+    steps.push({ step: '5_publish_screen', went, url: page.url(), sale1, cta: await topCta() });
+    if (sale1.isPaid !== 'paid' || sale1.priceValue !== expectPrice) return abort('販売設定が想定と違います', { sale1 });
+
+    // --- 6. 有料ラインを paidAnchor の直前に引き直す ---
+    const opened = await page.evaluate(() => {
+      const el = [...document.querySelectorAll('button')].find(x => (x.textContent || '').trim() === '有料エリア設定' && x.offsetParent !== null);
+      if (!el) return { ok: false };
+      el.click(); return { ok: true };
+    });
+    if (!opened.ok) return abort('「有料エリア設定」ボタンが見つかりません', { cta: await topCta() });
+    await page.waitForTimeout(9000);
+    const paidArea = await page.evaluate((anchor) => {
+      const LABEL = 'ラインをこの場所に変更';
+      const btns = [...document.querySelectorAll('button')].filter(x => (x.textContent || '').trim() === LABEL);
+      const anchorEl = [...document.querySelectorAll('*')].find(el => el.childElementCount === 0 && (el.textContent || '').indexOf(anchor) >= 0);
+      if (!anchorEl) return { ok: false, reason: 'アンカーが見つからない', total: btns.length };
+      // 現在のライン位置がすでにアンカー直前なら、ボタンは出ないことがある。その場合は既存ラインの直後を確かめる
+      let best = null;
+      for (const x of btns) { if (x.compareDocumentPosition(anchorEl) & Node.DOCUMENT_POSITION_FOLLOWING) best = x; else break; }
+      const CHROME = [LABEL, 'このラインより先を有料にする', 'ここから先は有料エリアです'];
+      const isChrome = (t) => CHROME.some(c => t === c || t.indexOf(c) >= 0);
+      const all = [...document.querySelectorAll('*')];
+      const textAfter = (from) => {
+        for (let i = all.indexOf(from) + 1; i < all.length && i < all.indexOf(from) + 400; i++) {
+          const el = all[i]; if (el.childElementCount !== 0) continue;
+          const t = (el.textContent || '').trim(); if (!t || isChrome(t)) continue; return t.slice(0, 40);
+        }
+        return '(なし)';
+      };
+      if (!best) return { ok: false, reason: 'アンカーより前にラインのボタンが無い', total: btns.length };
+      const nextText = textAfter(best);
+      if (nextText.indexOf(anchor) < 0) return { ok: false, reason: '選んだ位置の直後がアンカー行ではない', nextText, total: btns.length };
+      best.scrollIntoView({ block: 'center' }); best.click();
+      return { ok: true, nextText, total: btns.length };
+    }, paidAnchor);
+    await page.waitForTimeout(8000);
+    const cta = await topCta();
+    const sale2 = await saleState();
+    steps.push({ step: '6_paid_area', paidArea, cta, sale2 });
+    if (!paidArea.ok) return abort('有料ラインを引き直せませんでした');
+    if (sale2.isPaid !== 'paid' || sale2.priceValue !== expectPrice) return abort('ライン設定後に販売設定が変わりました', { sale2 });
+    if (!cta.some(t => /^(更新する|投稿する|公開する)$/.test(t))) return abort('確定ボタンが出ていません', { cta });
+
+    if (dryRun) {
+      await browser.close(); publishing = false;
+      return res.json(saveResult_({ success: true, dryRun: true, message: '確定ボタンの手前まで確認（押していません・公開中の記事は元のまま）', steps }));
+    }
+
+    // --- 7. 確定 ---
+    const pushed = await page.evaluate(() => {
+      const el = [...document.querySelectorAll('button')]
+        .filter(x => { const r = x.getBoundingClientRect(); return r.top >= 0 && r.top < 70 && r.width > 0; })
+        .find(x => /^(更新する|投稿する|公開する)$/.test((x.textContent || '').trim()));
+      if (!el) return { ok: false };
+      el.click(); return { ok: true, text: (el.textContent || '').trim() };
+    });
+    await page.waitForTimeout(3000);
+    const confirmDlg = await page.evaluate(() => {
+      const el = [...document.querySelectorAll('button')].filter(x => x.offsetParent !== null)
+        .find(x => /^(更新する|投稿する|公開する|はい|OK)$/.test((x.textContent || '').trim()));
+      if (!el) return { needed: false };
+      el.click(); return { needed: true, text: (el.textContent || '').trim() };
+    });
+    await page.waitForTimeout(12000);
+    steps.push({ step: '7_saved', pushed, confirmDlg, url: page.url() });
+
+    await browser.close();
+    res.json(saveResult_({ success: !!pushed.ok, steps }));
+  } catch (e) {
+    if (browser) await browser.close().catch(() => {});
+    res.status(500).json(saveResult_({ success: false, error: e.message, steps }));
+  } finally { publishing = false; }
+});
+
+// ============================================================
 // POST /publish-existing … 既存の下書きを、noteの正規フローで有料公開する（2026-09-16追加）
 // Body: { cookie, key, price, tags?, paidAnchor, confirm, dryRun? }
 //
