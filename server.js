@@ -1055,7 +1055,9 @@ app.post('/replace-body', async (req, res) => {
       const imgCheck = await page.evaluate((args) => {
         const root = document.querySelector(args.sel);
         const all = root.innerText || '';
-        return { leftToken: /\[\[IMG:/.test(all), missing: args.must.filter(s => all.indexOf(s) < 0) };
+        const left = [...all.matchAll(/\[\[IMG:[^\]]*\]\]/g)].map(m => ({ t: m[0], ctx: all.slice(Math.max(0, m.index - 60), m.index + 80).replace(/\n+/g, ' ⏎ ') }));
+        const dup = args.must.map(s => ({ s, n: all.split(s).length - 1 })).filter(x => x.n > 1);
+        return { leftToken: left.length > 0, left, dup, textLen: all.length, missing: args.must.filter(s => all.indexOf(s) < 0) };
       }, { sel: bodySel, must: mustContain });
       steps.push({ step: '3b_images', imgLog, imgCheck });
       if (imgLog.length !== imgNames.length || imgLog.some(x => !x.ok) || imgCheck.leftToken) return abort('図解の差し込みに失敗しました');
