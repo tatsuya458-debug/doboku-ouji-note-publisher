@@ -930,13 +930,19 @@ app.post('/replace-body', async (req, res) => {
 
     // --- 1. 編集画面を開く ---
     await page.goto('https://editor.note.com/notes/' + key + '/edit/', { waitUntil: 'domcontentloaded', timeout: 60000 });
-    await page.waitForTimeout(18000);
+    const bodySel = 'div.ProseMirror[contenteditable="true"], div[contenteditable="true"][role="textbox"], div[contenteditable="true"]';
+    // 固定待ちでは足りないことがある（2026-09-30: 18秒で空画面のまま失敗）。エディタが出るまで最大60秒待つ
+    await page.waitForSelector(bodySel, { timeout: 60000 }).catch(() => {});
+    await page.waitForTimeout(5000);
     if (page.url().includes('/login')) return abort('cookie expired');
     await dismissModals(page);
-    const bodySel = 'div.ProseMirror[contenteditable="true"], div[contenteditable="true"][role="textbox"]';
     const before = await page.evaluate((sel) => {
       const el = document.querySelector(sel);
-      return { found: !!el, textLen: el ? (el.innerText || '').length : 0 };
+      return {
+        found: !!el, textLen: el ? (el.innerText || '').length : 0,
+        url: location.href, docTitle: document.title,
+        bodyHead: (document.body.innerText || '').slice(0, 300),
+      };
     }, bodySel);
     steps.push({ step: '1_open', before, cta: await topCta() });
     if (!before.found) return abort('本文エディタが見つかりません');
@@ -982,6 +988,75 @@ app.post('/replace-body', async (req, res) => {
     if (!pasted.handled) return abort('貼り付けがエディタに受け付けられませんでした');
     if (check.missing.length || check.leftover.length) return abort('貼り付け後の本文が想定と違います');
 
+    // --- 3b. 図解の差し込み：本文中の [[IMG:名前]] 段落を空にして、＋メニュー→画像 でアップロード ---
+    const images = (b.images && typeof b.images === 'object') ? b.images : {};
+    const imgNames = [...body.matchAll(/\[\[IMG:([\w-]+)\]\]/g)].map(m => m[1]);
+    if (imgNames.length) {
+      const imgLog = [];
+      for (const name of imgNames) {
+        const data = images[name];
+        if (!data) { imgLog.push({ name, ok: false, reason: '画像データが送られていない' }); break; }
+        const ext = /^data:image\/jpe?g/.test(data) ? 'jpg' : 'png';
+        const file = join(tmpdir(), `inline_${name}_${crypto.randomBytes(4).toString('hex')}.${ext}`);
+        writeFileSync(file, Buffer.from(data.replace(/^data:image\/\w+;base64,/, ''), 'base64'));
+        const imgBefore = await page.evaluate((sel) => document.querySelector(sel).querySelectorAll('img').length, bodySel);
+        // プレースホルダ段落の文字を選択して消し、空行にしてキャレットを置く
+        const ph = await page.evaluate((args) => {
+          const root = document.querySelector(args.sel);
+          const token = '[[IMG:' + args.name + ']]';
+          const p = [...root.querySelectorAll('p')].find(x => (x.textContent || '').trim() === token);
+          if (!p) return { ok: false, reason: 'プレースホルダが見つからない' };
+          p.scrollIntoView({ block: 'center' });
+          const r = document.createRange(); r.selectNodeContents(p);
+          const s = window.getSelection(); s.removeAllRanges(); s.addRange(r);
+          return { ok: true };
+        }, { sel: bodySel, name });
+        if (!ph.ok) { imgLog.push({ name, ...ph }); try { unlinkSync(file); } catch {} break; }
+        await page.keyboard.press('Backspace');
+        await page.waitForTimeout(1200);
+        let uploaded = false, how = '';
+        const plusBtn = page.locator('button[aria-label="メニューを開く"]').first();
+        if (await plusBtn.isVisible({ timeout: 4000 }).catch(() => false)) {
+          await plusBtn.click({ force: true });
+          await page.waitForTimeout(1200);
+          const chooserP = page.waitForEvent('filechooser', { timeout: 8000 }).catch(() => null);
+          const clicked = await page.evaluate(() => {
+            const vis = [...document.querySelectorAll('button')].filter(x => x.offsetParent !== null);
+            const btn = vis.find(x => (x.textContent || '').trim() === '画像');
+            if (btn) { btn.click(); return true; }
+            return false;
+          });
+          const chooser = clicked ? await chooserP : null;
+          if (chooser) { await chooser.setFiles(file); uploaded = true; how = 'filechooser'; }
+          else if (clicked) {
+            const input = page.locator('input[type="file"]').last();
+            if (await input.count().catch(() => 0)) { await input.setInputFiles(file); uploaded = true; how = 'input'; }
+          }
+          if (!clicked) how = '「画像」項目なし';
+        } else how = '＋ボタンが出ない';
+        // アップロード完了（img が1枚増える）を最大40秒待つ
+        let imgAfter = imgBefore;
+        for (let i = 0; i < 20 && uploaded; i++) {
+          await page.waitForTimeout(2000);
+          imgAfter = await page.evaluate((sel) => document.querySelector(sel).querySelectorAll('img').length, bodySel);
+          if (imgAfter > imgBefore) break;
+        }
+        try { unlinkSync(file); } catch {}
+        const ok = imgAfter > imgBefore;
+        imgLog.push({ name, ok, how, imgBefore, imgAfter });
+        if (!ok) break;
+        await page.waitForTimeout(1500);
+      }
+      const imgCheck = await page.evaluate((args) => {
+        const root = document.querySelector(args.sel);
+        const all = root.innerText || '';
+        return { leftToken: /\[\[IMG:/.test(all), imgs: root.querySelectorAll('img').length, missing: args.must.filter(s => all.indexOf(s) < 0) };
+      }, { sel: bodySel, must: mustContain });
+      steps.push({ step: '3b_images', imgLog, imgCheck });
+      if (imgLog.length !== imgNames.length || imgLog.some(x => !x.ok) || imgCheck.leftToken) return abort('図解の差し込みに失敗しました');
+      if (imgCheck.missing.length) return abort('図解の差し込み後に本文が欠けました');
+    }
+
     // --- 4. 目次（任意）：tocBefore の見出しの直前の空行に＋メニューから入れる ---
     if (tocBefore) {
       const placed = await page.evaluate((args) => {
@@ -1022,6 +1097,12 @@ app.post('/replace-body', async (req, res) => {
       if (toc.after.missing.length) return abort('目次の挿入後に本文が欠けました');
     }
     await page.waitForTimeout(4000);   // 自動保存
+    if (b.stopAfterEdit) {
+      // 動作確認用：公開設定画面には進まずに閉じる
+      const html2 = await page.evaluate((sel) => document.querySelector(sel).innerHTML.replace(/ (name|id)="[^"]*"/g, '').slice(0, 3000), bodySel);
+      await browser.close(); publishing = false;
+      return res.json(saveResult_({ success: true, stopAfterEdit: true, steps, htmlHead: html2 }));
+    }
 
     // --- 5. 公開に進む → 販売設定画面 ---
     const went = await page.evaluate(() => {
