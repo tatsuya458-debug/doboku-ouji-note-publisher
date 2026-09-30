@@ -1099,13 +1099,15 @@ app.post('/replace-body', async (req, res) => {
     check.order = await page.evaluate((args) => {
       const kids = [...document.querySelector(args.sel).children];
       const out = [];
+      const allFigs = [];
       let prev = '';
       for (const k of kids) {
+        if (k.tagName === 'FIGURE') { allFigs.push(prev.slice(0, 12) + ' | ' + k.innerHTML.replace(/ (class|name|id|contenteditable|draggable)="[^"]*"/g, '').slice(0, 70)); }
         if (k.tagName === 'FIGURE' && !k.querySelector('blockquote')) { out.push(prev); continue; }   // noteは引用もfigureで囲む
         const t = (k.innerText || '').trim().split('\n').filter(Boolean).pop() || '';
         if (t) prev = t;
       }
-      return { figs: out.length, prevTexts: out.map(x => x.slice(0, 20)), ok: out.length === args.exp.length && out.every((x, i) => x.startsWith(args.exp[i])) };
+      return { allFigs, figs: out.length, prevTexts: out.map(x => x.slice(0, 20)), ok: out.length === args.exp.length && out.every((x, i) => x.startsWith(args.exp[i])) };
     }, { sel: bodySel, exp: expectBefore });
     check.expectBefore = expectBefore;
     steps.push({ step: '3_paste_and_images', pasteLog, imgLog, check });
