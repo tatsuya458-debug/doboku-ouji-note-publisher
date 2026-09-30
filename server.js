@@ -993,13 +993,17 @@ app.post('/replace-body', async (req, res) => {
     const imgNames = [...body.matchAll(/\[\[IMG:([\w-]+)\]\]/g)].map(m => m[1]);
     if (imgNames.length) {
       const imgLog = [];
+      const knownSrcs = new Set();
       for (const name of imgNames) {
         const data = images[name];
         if (!data) { imgLog.push({ name, ok: false, reason: '画像データが送られていない' }); break; }
         const ext = /^data:image\/jpe?g/.test(data) ? 'jpg' : 'png';
         const file = join(tmpdir(), `inline_${name}_${crypto.randomBytes(4).toString('hex')}.${ext}`);
         writeFileSync(file, Buffer.from(data.replace(/^data:image\/\w+;base64,/, ''), 'base64'));
-        const imgBefore = await page.evaluate((sel) => document.querySelector(sel).querySelectorAll('img').length, bodySel);
+        // 長い本文では画面外の画像がDOMから外れるため、枚数ではなく「新しいsrcが現れたか」で判定する（2026-09-30実測）
+        const srcsNow = async () => await page.evaluate((sel) => [...document.querySelector(sel).querySelectorAll('img')].map(i => i.src), bodySel);
+        const seenSrcs = new Set([...(await srcsNow()), ...knownSrcs]);
+        const imgBefore = seenSrcs.size;
         // プレースホルダ段落の文字を選択して消し、空行にしてキャレットを置く
         const ph = await page.evaluate((args) => {
           const root = document.querySelector(args.sel);
@@ -1035,22 +1039,23 @@ app.post('/replace-body', async (req, res) => {
           if (!clicked) how = '「画像」項目なし';
         } else how = '＋ボタンが出ない';
         // アップロード完了（img が1枚増える）を最大40秒待つ
-        let imgAfter = imgBefore;
+        let newSrc = null;
         for (let i = 0; i < 20 && uploaded; i++) {
           await page.waitForTimeout(2000);
-          imgAfter = await page.evaluate((sel) => document.querySelector(sel).querySelectorAll('img').length, bodySel);
-          if (imgAfter > imgBefore) break;
+          newSrc = (await srcsNow()).find(x => !seenSrcs.has(x) && /st-note\.com/.test(x)) || null;
+          if (newSrc) break;
         }
         try { unlinkSync(file); } catch {}
-        const ok = imgAfter > imgBefore;
-        imgLog.push({ name, ok, how, imgBefore, imgAfter });
+        const ok = !!newSrc;
+        if (newSrc) knownSrcs.add(newSrc);
+        imgLog.push({ name, ok, how, newSrc: newSrc ? newSrc.slice(-40) : null });
         if (!ok) break;
         await page.waitForTimeout(1500);
       }
       const imgCheck = await page.evaluate((args) => {
         const root = document.querySelector(args.sel);
         const all = root.innerText || '';
-        return { leftToken: /\[\[IMG:/.test(all), imgs: root.querySelectorAll('img').length, missing: args.must.filter(s => all.indexOf(s) < 0) };
+        return { leftToken: /\[\[IMG:/.test(all), missing: args.must.filter(s => all.indexOf(s) < 0) };
       }, { sel: bodySel, must: mustContain });
       steps.push({ step: '3b_images', imgLog, imgCheck });
       if (imgLog.length !== imgNames.length || imgLog.some(x => !x.ok) || imgCheck.leftToken) return abort('図解の差し込みに失敗しました');
