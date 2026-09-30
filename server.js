@@ -990,7 +990,9 @@ app.post('/replace-body', async (req, res) => {
         const seg = parts[i].replace(/^\n+/, '').replace(/\n+$/, '');
         if (!seg) continue;
 
-        const r = await pasteHtml(mdToNoteHtml_(seg));
+        // 画像の後ろの空行に引用や箇条書きをそのまま貼ると、noteは文字と囲みを分けてしまう（2026-09-30実測）。
+        // 2つ目以降は先頭に空段落を付けて、必ず段落から貼り始める
+        const r = await pasteHtml((i > 0 ? '<p><br></p>' : '') + mdToNoteHtml_(seg));
         pasteLog.push(r);
         await page.waitForTimeout(i === 0 ? 6000 : 2500);
         if (!r.handled) return abort('貼り付けがエディタに受け付けられませんでした', { pasteLog });
@@ -1107,11 +1109,13 @@ app.post('/replace-body', async (req, res) => {
         const t = (k.innerText || '').trim().split('\n').filter(Boolean).pop() || '';
         if (t) prev = t;
       }
-      return { allFigs, figs: out.length, prevTexts: out.map(x => x.slice(0, 20)), ok: out.length === args.exp.length && out.every((x, i) => x.startsWith(args.exp[i])) };
+      const emptyQuotes = [...document.querySelector(args.sel).querySelectorAll('blockquote')].filter(q => !(q.innerText || '').trim()).length;
+      return { emptyQuotes, allFigs, figs: out.length, prevTexts: out.map(x => x.slice(0, 20)), ok: out.length === args.exp.length && out.every((x, i) => x.startsWith(args.exp[i])) };
     }, { sel: bodySel, exp: expectBefore });
     check.expectBefore = expectBefore;
     steps.push({ step: '3_paste_and_images', pasteLog, imgLog, check });
     if (!check.order.ok) return abort('図解の位置が原稿とずれています');
+    if (check.order.emptyQuotes) return abort('中身の空の引用ブロックがあります');
     if (check.missing.length || check.leftover.length || check.leftToken) return abort('貼り付け後の本文が想定と違います');
     if (imgLog.length !== imgNames.length) return abort('図解の枚数が合いません');
 
@@ -1218,7 +1222,9 @@ app.post('/replace-body', async (req, res) => {
     const sale2 = await saleState();
     steps.push({ step: '6_paid_area', paidArea, cta, sale2 });
     if (!paidArea.ok) return abort('有料ラインを引き直せませんでした');
-    if (sale2.isPaid !== 'paid' || sale2.priceValue !== expectPrice) return abort('ライン設定後に販売設定が変わりました', { sale2 });
+    // ライン設定の画面では価格欄とラジオが画面から外れる（2026-09-30実測）。見えているときだけ照合する。
+    // 有料・価格は手順5（ライン設定の前）で確認済み
+    if (sale2.isPaid !== '(未選択)' && (sale2.isPaid !== 'paid' || sale2.priceValue !== expectPrice)) return abort('ライン設定後に販売設定が変わりました', { sale2 });
     if (!cta.some(t => /^(更新する|投稿する|公開する)$/.test(t))) return abort('確定ボタンが出ていません', { cta });
 
     if (dryRun) {
