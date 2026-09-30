@@ -989,7 +989,7 @@ app.post('/replace-body', async (req, res) => {
       if (i % 2 === 0) {
         const seg = parts[i].replace(/^\n+/, '').replace(/\n+$/, '');
         if (!seg) continue;
-        if (i > 0) { await page.keyboard.press('Control+End'); await page.waitForTimeout(600); }
+
         const r = await pasteHtml(mdToNoteHtml_(seg));
         pasteLog.push(r);
         await page.waitForTimeout(i === 0 ? 6000 : 2500);
@@ -1002,9 +1002,12 @@ app.post('/replace-body', async (req, res) => {
       const ext = /^data:image\/jpe?g/.test(data) ? 'jpg' : 'png';
       const file = join(tmpdir(), `inline_${name}_${crypto.randomBytes(4).toString('hex')}.${ext}`);
       writeFileSync(file, Buffer.from(data.replace(/^data:image\/\w+;base64,/, ''), 'base64'));
+      // 空行を2つ作って1つ目に画像を入れる（画像の後ろに空行を1つ残し、次の文章の入口にする）
       await page.keyboard.press('Control+End');
       await page.waitForTimeout(400);
       await page.keyboard.press('Enter');
+      await page.keyboard.press('Enter');
+      await page.keyboard.press('ArrowUp');
       await page.waitForTimeout(1200);
       const seenSrcs = new Set([...(await srcsNow()), ...knownSrcs]);
       let uploaded = false, how = '';
@@ -1034,6 +1037,26 @@ app.post('/replace-body', async (req, res) => {
       imgLog.push({ name, ok: !!newSrc, how, newSrc: newSrc ? newSrc.slice(-40) : null });
       if (!newSrc) return abort('図解の差し込みに失敗しました: ' + name, { imgLog });
       await page.waitForTimeout(1000);
+      // アップロード直後は画像が選択された状態になる。末尾の空行を実クリックして入力位置を戻す
+      await page.keyboard.press('Escape').catch(() => {});
+      const lastRect = await page.evaluate((sel) => {
+        const root = document.querySelector(sel);
+        const last = root.lastElementChild;
+        if (!last) return null;
+        last.scrollIntoView({ block: 'center' });
+        const r = last.getBoundingClientRect();
+        return { tag: last.tagName, text: (last.textContent || '').trim().slice(0, 20), x: r.left + 20, y: r.top + r.height / 2 };
+      }, bodySel);
+      if (!lastRect || lastRect.tag !== 'P' || lastRect.text !== '') return abort('画像の後ろに空行がありません: ' + name, { imgLog, lastRect });
+      await page.waitForTimeout(500);
+      const lastRect2 = await page.evaluate((sel) => { const r = document.querySelector(sel).lastElementChild.getBoundingClientRect(); return { x: r.left + 20, y: r.top + r.height / 2 }; }, bodySel);
+      await page.mouse.click(lastRect2.x, lastRect2.y);
+      await page.waitForTimeout(600);
+      const caretAtEnd = await page.evaluate((sel) => {
+        const root = document.querySelector(sel); const s = window.getSelection();
+        return !!s.anchorNode && root.lastElementChild.contains(s.anchorNode);
+      }, bodySel);
+      if (!caretAtEnd) return abort('画像の後ろに入力位置を戻せませんでした: ' + name, { imgLog });
     }
     const check = await page.evaluate((args) => {
       const all = document.querySelector(args.sel).innerText || '';
