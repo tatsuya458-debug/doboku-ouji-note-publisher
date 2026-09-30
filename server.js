@@ -1004,20 +1004,41 @@ app.post('/replace-body', async (req, res) => {
         const srcsNow = async () => await page.evaluate((sel) => [...document.querySelector(sel).querySelectorAll('img')].map(i => i.src), bodySel);
         const seenSrcs = new Set([...(await srcsNow()), ...knownSrcs]);
         const imgBefore = seenSrcs.size;
-        // プレースホルダ段落の文字を選択して消し、空行にしてキャレットを置く
-        const ph = await page.evaluate((args) => {
+        // プレースホルダ段落を実クリックで選んで消す（DOMのRange操作だけだとエディタに伝わる前にキーが効き、
+        // 長文では別の場所を消していた・2026-09-30実測）
+        const token = '[[IMG:' + name + ']]';
+        const rect = await page.evaluate((args) => {
           const root = document.querySelector(args.sel);
-          const token = '[[IMG:' + args.name + ']]';
-          const p = [...root.querySelectorAll('p')].find(x => (x.textContent || '').trim() === token);
-          if (!p) return { ok: false, reason: 'プレースホルダが見つからない' };
+          const p = [...root.querySelectorAll('p')].find(x => (x.textContent || '').trim() === args.token);
+          if (!p) return null;
           p.scrollIntoView({ block: 'center' });
           const r = document.createRange(); r.selectNodeContents(p);
-          const s = window.getSelection(); s.removeAllRanges(); s.addRange(r);
-          return { ok: true };
-        }, { sel: bodySel, name });
-        if (!ph.ok) { imgLog.push({ name, ...ph }); try { unlinkSync(file); } catch {} break; }
+          const b = r.getBoundingClientRect();
+          return { x: b.right - 2, y: b.top + b.height / 2 };
+        }, { sel: bodySel, token });
+        if (!rect) { imgLog.push({ name, ok: false, reason: 'プレースホルダが見つからない' }); try { unlinkSync(file); } catch {} break; }
+        await page.waitForTimeout(800);
+        const rect2 = await page.evaluate((args) => {
+          const p = [...document.querySelector(args.sel).querySelectorAll('p')].find(x => (x.textContent || '').trim() === args.token);
+          const r = document.createRange(); r.selectNodeContents(p); const b = r.getBoundingClientRect();
+          return { x: b.right - 2, y: b.top + b.height / 2 };
+        }, { sel: bodySel, token });
+        await page.mouse.click(rect2.x, rect2.y);
+        await page.waitForTimeout(500);
+        await page.keyboard.press('End');
+        await page.keyboard.press('Shift+Home');
+        await page.waitForTimeout(500);
+        const selected = await page.evaluate(() => window.getSelection().toString());
+        if (selected.trim() !== token) { imgLog.push({ name, ok: false, reason: '選択がずれた', selected: selected.slice(0, 60) }); try { unlinkSync(file); } catch {} break; }
         await page.keyboard.press('Backspace');
-        await page.waitForTimeout(1200);
+        await page.waitForTimeout(800);
+        const cleared = await page.evaluate((args) => {
+          const all = document.querySelector(args.sel).innerText || '';
+          const s = window.getSelection(); const blk = s.anchorNode && (s.anchorNode.nodeType === 1 ? s.anchorNode : s.anchorNode.parentElement);
+          const p = blk && blk.closest('p');
+          return { gone: all.indexOf(args.token) < 0, caretEmpty: !!p && (p.textContent || '').trim() === '' };
+        }, { sel: bodySel, token });
+        if (!cleared.gone || !cleared.caretEmpty) { imgLog.push({ name, ok: false, reason: '目印を消せなかった', cleared }); try { unlinkSync(file); } catch {} break; }
         let uploaded = false, how = '';
         const plusBtn = page.locator('button[aria-label="メニューを開く"]').first();
         if (await plusBtn.isVisible({ timeout: 4000 }).catch(() => false)) {
