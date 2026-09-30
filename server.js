@@ -957,13 +957,16 @@ app.post('/replace-body', async (req, res) => {
     steps.push({ step: '2_title', titleNow });
     if (titleNow !== title) return abort('タイトルが入りませんでした');
 
-    // --- 3. 本文を全選択して貼り付け ---
-    await page.locator(bodySel).first().click({ force: true });
-    await page.waitForTimeout(500);
-    await page.keyboard.press('Control+a');
-    await page.waitForTimeout(800);
-    const html = mdToNoteHtml_(body);
-    const pasted = await page.evaluate((args) => {
+    // --- 3. 本文の貼り付けと図解の差し込み（2026-09-30 方式変更） ---
+    // 本文を [[IMG:名前]] の行で区切り、「文章を貼る → 末尾に空行を作って＋メニュー→画像 → 次の文章を貼る」を繰り返す。
+    // 目印を貼ってから後で探して消す方式は、長文だとエディタの選択がDOMとずれて失敗した（別の場所を消す危険もあった）。
+    // 操作はすべて実キー（Ctrl+A / Ctrl+End / Enter）で、常に文書の末尾で作業する。
+    const images = (b.images && typeof b.images === 'object') ? b.images : {};
+    const parts = body.split(/^\[\[IMG:([\w-]+)\]\][ \t]*$/m);   // [文章, 画像名, 文章, 画像名, ...]
+    const imgNames = parts.filter((_, i) => i % 2 === 1);
+    for (const n of imgNames) if (!images[n]) return abort('画像データが送られていません: ' + n);
+
+    const pasteHtml = async (h) => await page.evaluate((args) => {
       const el = document.querySelector(args.sel);
       el.focus();
       const dt = new DataTransfer();
@@ -972,8 +975,66 @@ app.post('/replace-body', async (req, res) => {
       const ev = new ClipboardEvent('paste', { clipboardData: dt, bubbles: true, cancelable: true });
       el.dispatchEvent(ev);
       return { handled: ev.defaultPrevented, htmlLen: args.h.length };
-    }, { sel: bodySel, h: html });
-    await page.waitForTimeout(8000);
+    }, { sel: bodySel, h });
+    const srcsNow = async () => await page.evaluate((sel) => [...document.querySelector(sel).querySelectorAll('img')].map(i => i.src), bodySel);
+
+    await page.locator(bodySel).first().click({ force: true });
+    await page.waitForTimeout(500);
+    await page.keyboard.press('Control+a');
+    await page.waitForTimeout(800);
+    const pasteLog = [];
+    const imgLog = [];
+    const knownSrcs = new Set();
+    for (let i = 0; i < parts.length; i++) {
+      if (i % 2 === 0) {
+        const seg = parts[i].replace(/^\n+/, '').replace(/\n+$/, '');
+        if (!seg) continue;
+        if (i > 0) { await page.keyboard.press('Control+End'); await page.waitForTimeout(600); }
+        const r = await pasteHtml(mdToNoteHtml_(seg));
+        pasteLog.push(r);
+        await page.waitForTimeout(i === 0 ? 6000 : 2500);
+        if (!r.handled) return abort('貼り付けがエディタに受け付けられませんでした', { pasteLog });
+        continue;
+      }
+      // 画像：末尾に空行を作り、＋メニュー→画像
+      const name = parts[i];
+      const data = images[name];
+      const ext = /^data:image\/jpe?g/.test(data) ? 'jpg' : 'png';
+      const file = join(tmpdir(), `inline_${name}_${crypto.randomBytes(4).toString('hex')}.${ext}`);
+      writeFileSync(file, Buffer.from(data.replace(/^data:image\/\w+;base64,/, ''), 'base64'));
+      await page.keyboard.press('Control+End');
+      await page.waitForTimeout(400);
+      await page.keyboard.press('Enter');
+      await page.waitForTimeout(1200);
+      const seenSrcs = new Set([...(await srcsNow()), ...knownSrcs]);
+      let uploaded = false, how = '';
+      const plusBtn = page.locator('button[aria-label="メニューを開く"]').first();
+      if (await plusBtn.isVisible({ timeout: 4000 }).catch(() => false)) {
+        await plusBtn.click({ force: true });
+        await page.waitForTimeout(1200);
+        const chooserP = page.waitForEvent('filechooser', { timeout: 8000 }).catch(() => null);
+        const clicked = await page.evaluate(() => {
+          const vis = [...document.querySelectorAll('button')].filter(x => x.offsetParent !== null);
+          const btn = vis.find(x => (x.textContent || '').trim() === '画像');
+          if (btn) { btn.click(); return true; }
+          return false;
+        });
+        const chooser = clicked ? await chooserP : null;
+        if (chooser) { await chooser.setFiles(file); uploaded = true; how = 'filechooser'; }
+        else how = clicked ? 'filechooserが開かない' : '「画像」項目なし';
+      } else how = '＋ボタンが出ない';
+      let newSrc = null;
+      for (let k = 0; k < 20 && uploaded; k++) {
+        await page.waitForTimeout(2000);
+        newSrc = (await srcsNow()).find(x => !seenSrcs.has(x) && /st-note\.com/.test(x)) || null;
+        if (newSrc) break;
+      }
+      try { unlinkSync(file); } catch {}
+      if (newSrc) knownSrcs.add(newSrc);
+      imgLog.push({ name, ok: !!newSrc, how, newSrc: newSrc ? newSrc.slice(-40) : null });
+      if (!newSrc) return abort('図解の差し込みに失敗しました: ' + name, { imgLog });
+      await page.waitForTimeout(1000);
+    }
     const check = await page.evaluate((args) => {
       const all = document.querySelector(args.sel).innerText || '';
       return {
@@ -982,108 +1043,13 @@ app.post('/replace-body', async (req, res) => {
         tail: all.slice(-80),
         missing: args.must.filter(s => all.indexOf(s) < 0),
         leftover: args.mustNot.filter(s => all.indexOf(s) >= 0),
+        leftToken: /\[\[IMG:/.test(all),
+        dup: args.must.map(s => ({ s, n: all.split(s).length - 1 })).filter(x => x.n > 1),
       };
     }, { sel: bodySel, must: mustContain, mustNot: mustNotContain });
-    steps.push({ step: '3_paste', pasted, check });
-    if (!pasted.handled) return abort('貼り付けがエディタに受け付けられませんでした');
-    if (check.missing.length || check.leftover.length) return abort('貼り付け後の本文が想定と違います');
-
-    // --- 3b. 図解の差し込み：本文中の [[IMG:名前]] 段落を空にして、＋メニュー→画像 でアップロード ---
-    const images = (b.images && typeof b.images === 'object') ? b.images : {};
-    const imgNames = [...body.matchAll(/\[\[IMG:([\w-]+)\]\]/g)].map(m => m[1]);
-    if (imgNames.length) {
-      const imgLog = [];
-      const knownSrcs = new Set();
-      for (const name of imgNames) {
-        const data = images[name];
-        if (!data) { imgLog.push({ name, ok: false, reason: '画像データが送られていない' }); break; }
-        const ext = /^data:image\/jpe?g/.test(data) ? 'jpg' : 'png';
-        const file = join(tmpdir(), `inline_${name}_${crypto.randomBytes(4).toString('hex')}.${ext}`);
-        writeFileSync(file, Buffer.from(data.replace(/^data:image\/\w+;base64,/, ''), 'base64'));
-        // 長い本文では画面外の画像がDOMから外れるため、枚数ではなく「新しいsrcが現れたか」で判定する（2026-09-30実測）
-        const srcsNow = async () => await page.evaluate((sel) => [...document.querySelector(sel).querySelectorAll('img')].map(i => i.src), bodySel);
-        const seenSrcs = new Set([...(await srcsNow()), ...knownSrcs]);
-        const imgBefore = seenSrcs.size;
-        // プレースホルダ段落を実クリックで選んで消す（DOMのRange操作だけだとエディタに伝わる前にキーが効き、
-        // 長文では別の場所を消していた・2026-09-30実測）
-        const token = '[[IMG:' + name + ']]';
-        const rect = await page.evaluate((args) => {
-          const root = document.querySelector(args.sel);
-          const p = [...root.querySelectorAll('p')].find(x => (x.textContent || '').trim() === args.token);
-          if (!p) return null;
-          p.scrollIntoView({ block: 'center' });
-          const r = document.createRange(); r.selectNodeContents(p);
-          const b = r.getBoundingClientRect();
-          return { x: b.right - 2, y: b.top + b.height / 2 };
-        }, { sel: bodySel, token });
-        if (!rect) { imgLog.push({ name, ok: false, reason: 'プレースホルダが見つからない' }); try { unlinkSync(file); } catch {} break; }
-        await page.waitForTimeout(800);
-        const rect2 = await page.evaluate((args) => {
-          const p = [...document.querySelector(args.sel).querySelectorAll('p')].find(x => (x.textContent || '').trim() === args.token);
-          const r = document.createRange(); r.selectNodeContents(p); const b = r.getBoundingClientRect();
-          return { x: b.right - 2, y: b.top + b.height / 2 };
-        }, { sel: bodySel, token });
-        await page.mouse.click(rect2.x, rect2.y);
-        await page.waitForTimeout(500);
-        await page.keyboard.press('End');
-        await page.keyboard.press('Shift+Home');
-        await page.waitForTimeout(500);
-        const selected = await page.evaluate(() => window.getSelection().toString());
-        if (selected.trim() !== token) { imgLog.push({ name, ok: false, reason: '選択がずれた', selected: selected.slice(0, 60) }); try { unlinkSync(file); } catch {} break; }
-        await page.keyboard.press('Backspace');
-        await page.waitForTimeout(800);
-        const cleared = await page.evaluate((args) => {
-          const all = document.querySelector(args.sel).innerText || '';
-          const s = window.getSelection(); const blk = s.anchorNode && (s.anchorNode.nodeType === 1 ? s.anchorNode : s.anchorNode.parentElement);
-          const p = blk && blk.closest('p');
-          return { gone: all.indexOf(args.token) < 0, caretEmpty: !!p && (p.textContent || '').trim() === '' };
-        }, { sel: bodySel, token });
-        if (!cleared.gone || !cleared.caretEmpty) { imgLog.push({ name, ok: false, reason: '目印を消せなかった', cleared }); try { unlinkSync(file); } catch {} break; }
-        let uploaded = false, how = '';
-        const plusBtn = page.locator('button[aria-label="メニューを開く"]').first();
-        if (await plusBtn.isVisible({ timeout: 4000 }).catch(() => false)) {
-          await plusBtn.click({ force: true });
-          await page.waitForTimeout(1200);
-          const chooserP = page.waitForEvent('filechooser', { timeout: 8000 }).catch(() => null);
-          const clicked = await page.evaluate(() => {
-            const vis = [...document.querySelectorAll('button')].filter(x => x.offsetParent !== null);
-            const btn = vis.find(x => (x.textContent || '').trim() === '画像');
-            if (btn) { btn.click(); return true; }
-            return false;
-          });
-          const chooser = clicked ? await chooserP : null;
-          if (chooser) { await chooser.setFiles(file); uploaded = true; how = 'filechooser'; }
-          else if (clicked) {
-            const input = page.locator('input[type="file"]').last();
-            if (await input.count().catch(() => 0)) { await input.setInputFiles(file); uploaded = true; how = 'input'; }
-          }
-          if (!clicked) how = '「画像」項目なし';
-        } else how = '＋ボタンが出ない';
-        // アップロード完了（img が1枚増える）を最大40秒待つ
-        let newSrc = null;
-        for (let i = 0; i < 20 && uploaded; i++) {
-          await page.waitForTimeout(2000);
-          newSrc = (await srcsNow()).find(x => !seenSrcs.has(x) && /st-note\.com/.test(x)) || null;
-          if (newSrc) break;
-        }
-        try { unlinkSync(file); } catch {}
-        const ok = !!newSrc;
-        if (newSrc) knownSrcs.add(newSrc);
-        imgLog.push({ name, ok, how, newSrc: newSrc ? newSrc.slice(-40) : null });
-        if (!ok) break;
-        await page.waitForTimeout(1500);
-      }
-      const imgCheck = await page.evaluate((args) => {
-        const root = document.querySelector(args.sel);
-        const all = root.innerText || '';
-        const left = [...all.matchAll(/\[\[IMG:[^\]]*\]\]/g)].map(m => ({ t: m[0], ctx: all.slice(Math.max(0, m.index - 60), m.index + 80).replace(/\n+/g, ' ⏎ ') }));
-        const dup = args.must.map(s => ({ s, n: all.split(s).length - 1 })).filter(x => x.n > 1);
-        return { leftToken: left.length > 0, left, dup, textLen: all.length, missing: args.must.filter(s => all.indexOf(s) < 0) };
-      }, { sel: bodySel, must: mustContain });
-      steps.push({ step: '3b_images', imgLog, imgCheck });
-      if (imgLog.length !== imgNames.length || imgLog.some(x => !x.ok) || imgCheck.leftToken) return abort('図解の差し込みに失敗しました');
-      if (imgCheck.missing.length) return abort('図解の差し込み後に本文が欠けました');
-    }
+    steps.push({ step: '3_paste_and_images', pasteLog, imgLog, check });
+    if (check.missing.length || check.leftover.length || check.leftToken) return abort('貼り付け後の本文が想定と違います');
+    if (imgLog.length !== imgNames.length) return abort('図解の枚数が合いません');
 
     // --- 4. 目次（任意）：tocBefore の見出しの直前の空行に＋メニューから入れる ---
     if (tocBefore) {
