@@ -1003,8 +1003,27 @@ app.post('/replace-body', async (req, res) => {
       const file = join(tmpdir(), `inline_${name}_${crypto.randomBytes(4).toString('hex')}.${ext}`);
       writeFileSync(file, Buffer.from(data.replace(/^data:image\/\w+;base64,/, ''), 'base64'));
       // 空行を2つ作って1つ目に画像を入れる（画像の後ろに空行を1つ残し、次の文章の入口にする）
-      await page.keyboard.press('Control+End');
+      // 末尾へはキー（Ctrl+End）だと貼り付け直後に効かないことがあった（2026-09-30実測で1段落ずれた）。
+      // 最後のブロックの文末を実クリックし、End で行末へ寄せ、入力位置が本当に末尾かを確かめてから改行する
+      const endRect = await page.evaluate((sel) => {
+        const last = document.querySelector(sel).lastElementChild;
+        last.scrollIntoView({ block: 'center' });
+        const r = document.createRange(); r.selectNodeContents(last);
+        const rs = r.getClientRects(); const b = rs.length ? rs[rs.length - 1] : last.getBoundingClientRect();
+        return { x: Math.max(b.right - 2, b.left + 2), y: b.top + b.height / 2 };
+      }, bodySel);
+      await page.waitForTimeout(500);
+      await page.mouse.click(endRect.x, endRect.y);
       await page.waitForTimeout(400);
+      await page.keyboard.press('End');
+      await page.waitForTimeout(300);
+      const atEnd = await page.evaluate((sel) => {
+        const last = document.querySelector(sel).lastElementChild; const s = window.getSelection();
+        if (!s.anchorNode || !last.contains(s.anchorNode)) return false;
+        const r = document.createRange(); r.selectNodeContents(last); r.setStart(s.anchorNode, s.anchorOffset);
+        return r.toString().length === 0;
+      }, bodySel);
+      if (!atEnd) return abort('文書の末尾に入力位置を置けませんでした（画像 ' + name + ' の前）', { imgLog });
       await page.keyboard.press('Enter');
       await page.keyboard.press('Enter');
       await page.keyboard.press('ArrowUp');
@@ -1070,7 +1089,27 @@ app.post('/replace-body', async (req, res) => {
         dup: args.must.map(s => ({ s, n: all.split(s).length - 1 })).filter(x => x.n > 1),
       };
     }, { sel: bodySel, must: mustContain, mustNot: mustNotContain });
+    // 画像の直前の文が原稿どおりか（＝正しい位置に入ったか）を照合する
+    const plainLine = (l) => l.trim().replace(/^#{1,6}\s*/, '').replace(/^[-*]\s+|^\d+\.\s+|^>\s*/, '').replace(/\*\*/g, '').replace(/`/g, '');
+    const expectBefore = [];
+    for (let i = 1; i < parts.length; i += 2) {
+      const lines = parts[i - 1].split('\n').map(plainLine).filter(x => x && !/^(-{3,}|_{3,}|\*{3,})$/.test(x));
+      expectBefore.push(lines.length ? lines[lines.length - 1].slice(0, 12) : '');
+    }
+    check.order = await page.evaluate((args) => {
+      const kids = [...document.querySelector(args.sel).children];
+      const out = [];
+      let prev = '';
+      for (const k of kids) {
+        if (k.tagName === 'FIGURE') { out.push(prev); continue; }
+        const t = (k.innerText || '').trim().split('\n').filter(Boolean).pop() || '';
+        if (t) prev = t;
+      }
+      return { figs: out.length, prevTexts: out.map(x => x.slice(0, 20)), ok: out.length === args.exp.length && out.every((x, i) => x.startsWith(args.exp[i])) };
+    }, { sel: bodySel, exp: expectBefore });
+    check.expectBefore = expectBefore;
     steps.push({ step: '3_paste_and_images', pasteLog, imgLog, check });
+    if (!check.order.ok) return abort('図解の位置が原稿とずれています');
     if (check.missing.length || check.leftover.length || check.leftToken) return abort('貼り付け後の本文が想定と違います');
     if (imgLog.length !== imgNames.length) return abort('図解の枚数が合いません');
 
