@@ -52,26 +52,28 @@ setInterval(sweepReels_, 30 * 60 * 1000).unref();
 
 app.post('/reel-upload', (req, res) => {
   try {
-    const { video, key } = req.body || {};
-    if (!video) return res.status(400).json({ success: false, error: 'video (base64) required' });
+    // video（mp4）か image（jpeg・リールのカバー用／2026-10-01追加）のどちらかを base64 で受け取る
+    const { video, image, key } = req.body || {};
+    if (!video && !image) return res.status(400).json({ success: false, error: 'video or image (base64) required' });
     const id = String(key || crypto.randomBytes(6).toString('hex')).replace(/[^A-Za-z0-9_-]/g, '');
-    const dest = join(tmpdir(), `reel_${id}.mp4`);
-    const b64 = String(video).replace(/^data:video\/\w+;base64,/, '');
+    const ext = image ? 'jpg' : 'mp4';
+    const dest = join(tmpdir(), `reel_${id}.${ext}`);
+    const b64 = String(image || video).replace(/^data:\w+\/[\w+.-]+;base64,/, '');
     writeFileSync(dest, Buffer.from(b64, 'base64'));
-    reelFiles.set(id, { path: dest, expires: Date.now() + REEL_TTL_MS });
+    reelFiles.set(id, { path: dest, expires: Date.now() + REEL_TTL_MS, ext });
     const base = process.env.PUBLIC_BASE_URL || 'https://doboku-ouji-note-publisher.onrender.com';
-    console.log(`reel-upload: ${id} (${(statSync(dest).size / 1024 / 1024).toFixed(2)} MB)`);
-    res.json({ success: true, url: `${base}/reel/${id}.mp4`, expiresInHours: 6 });
+    console.log(`reel-upload: ${id}.${ext} (${(statSync(dest).size / 1024 / 1024).toFixed(2)} MB)`);
+    res.json({ success: true, url: `${base}/reel/${id}.${ext}`, expiresInHours: 6 });
   } catch (e) {
     res.status(500).json({ success: false, error: e.message });
   }
 });
 
 app.get('/reel/:name', (req, res) => {
-  const id = String(req.params.name || '').replace(/\.mp4$/, '').replace(/[^A-Za-z0-9_-]/g, '');
+  const id = String(req.params.name || '').replace(/\.(mp4|jpg)$/, '').replace(/[^A-Za-z0-9_-]/g, '');
   const rec = reelFiles.get(id);
   if (!rec || !existsSync(rec.path)) return res.status(404).send('not found');
-  res.setHeader('Content-Type', 'video/mp4');
+  res.setHeader('Content-Type', rec.ext === 'jpg' ? 'image/jpeg' : 'video/mp4');
   res.setHeader('Content-Length', statSync(rec.path).size);
   createReadStream(rec.path).pipe(res);
 });
