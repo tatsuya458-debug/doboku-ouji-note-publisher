@@ -995,7 +995,8 @@ app.post('/replace-body', async (req, res) => {
             if (lab !== '削除') return false;
             const r = el.getBoundingClientRect();
             const cx = r.left + r.width / 2, cy = r.top + r.height / 2;
-            return r.width > 0 && cx >= ir.left && cx <= ir.right && cy >= ir.top && cy <= ir.bottom;
+            // 操作バーは画像の上端より上に浮かぶ（2026-10-01実測：画像top=101に対し削除ボタンtop=-50）
+            return r.width > 0 && cx >= ir.left && cx <= ir.right && cy >= ir.top - 200 && cy <= ir.bottom;
           });
           if (cands.length !== 1) {
             const all = [...document.querySelectorAll('button, [role="button"]')].filter(el => ((el.getAttribute('aria-label') || el.textContent || '').trim()) === '削除')
