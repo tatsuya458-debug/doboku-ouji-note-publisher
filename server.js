@@ -958,7 +958,7 @@ app.post('/replace-body', async (req, res) => {
       await page.evaluate(() => window.scrollTo(0, 0));
       await page.waitForTimeout(1500);
       const eyeImg = () => page.evaluate(() => {
-        const i = [...document.querySelectorAll('img')].find(x => { const r = x.getBoundingClientRect(); return r.top < 700 && r.width > 300 && /st-note\.com/.test(x.src); });
+        const i = [...document.querySelectorAll('img')].find(x => { const r = x.getBoundingClientRect(); return r.top < 700 && r.width > 300 && /st-note\.com/.test(x.src) && !x.closest('.ProseMirror'); });
         if (!i) return null;
         const r = i.getBoundingClientRect();
         return { src: i.src, x: r.left + r.width / 2, y: r.top + r.height / 2 };
@@ -979,16 +979,17 @@ app.post('/replace-body', async (req, res) => {
       });
       const SEL = ['[aria-label="画像を変更"]', 'button:has-text("画像を変更")', 'button:has-text("変更")', ...EYECATCH_ADD_SELECTORS];
       let hit = null;
+      let preUploaded = false;
       for (const sel of SEL) {
         const l = page.locator(sel).first();
         if (await l.isVisible({ timeout: 800 }).catch(() => false)) { hit = sel; await l.click({ force: true }); break; }
       }
-      if (!hit && before) {
+      if (!hit) {
         // 既存の見出し画像には「変更」が無く、ホバーで「削除」だけが出る（2026-10-01実測）。
         // 削除 → 「画像を追加」から入れ直す。押すのは見出し画像の矩形の中にある「削除」だけ（記事の削除と取り違えない）
         const del = await page.evaluate(() => {
-          const img = [...document.querySelectorAll('img')].find(x => { const r = x.getBoundingClientRect(); return r.top < 700 && r.width > 300 && /st-note\.com/.test(x.src); });
-          if (!img) return { ok: false, reason: 'img無し' };
+          const img = [...document.querySelectorAll('img')].find(x => { const r = x.getBoundingClientRect(); return r.top < 700 && r.width > 300 && /st-note\.com/.test(x.src) && !x.closest('.ProseMirror'); });
+          if (!img) return { ok: true, none: '見出し画像は既に無い' };
           const ir = img.getBoundingClientRect();
           const cands = [...document.querySelectorAll('button, [role="button"]')].filter(el => {
             const lab = (el.getAttribute('aria-label') || el.textContent || '').trim();
@@ -1019,13 +1020,25 @@ app.post('/replace-body', async (req, res) => {
             if (await l.isVisible({ timeout: 1500 }).catch(() => false)) { hit = '削除→' + sel; await l.click({ force: true }); break; }
           }
         }
-        steps.push({ step: '1b_eyecatch_delete', del, hit });
+        if (del.ok && !hit) {
+          const chooserP = page.waitForEvent('filechooser', { timeout: 8000 }).catch(() => null);
+          const clicked = await page.evaluate(() => {
+            const el = [...document.querySelectorAll('button')].find(x => { const r = x.getBoundingClientRect(); return r.top >= 0 && r.top < 70 && r.width > 0 && (x.textContent || '').trim() === '画像' && !x.closest('.ProseMirror'); });
+            if (!el) return false; el.click(); return true;
+          });
+          if (clicked) {
+            hit = '削除→上部の「画像」';
+            const fc = await chooserP;
+            if (fc) { await fc.setFiles(file); preUploaded = true; }
+          }
+        }
+        steps.push({ step: '1b_eyecatch_delete', del, hit, preUploaded });
       }
       if (!hit) { try { unlinkSync(file); } catch {} return abort('見出し画像の変更ボタンが見つかりません', { eyecatch: { before: before && before.src, controls } }); }
       await page.waitForTimeout(1500);
-      let uploaded = false, how = '';
+      let uploaded = preUploaded, how = preUploaded ? 'filechooser(上部の画像)' : '';
       const upCandidates = ['button:has-text("画像をアップロード")', 'button:has-text("アップロード")', 'button:has-text("ファイルを選択")', 'label:has-text("アップロード")'];
-      for (const sel of upCandidates) {
+      for (const sel of (preUploaded ? [] : upCandidates)) {
         const u = page.locator(sel).first();
         if (await u.isVisible({ timeout: 1500 }).catch(() => false)) {
           try {
