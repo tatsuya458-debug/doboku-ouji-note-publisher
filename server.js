@@ -1032,7 +1032,23 @@ app.post('/replace-body', async (req, res) => {
             if (fc) { await fc.setFiles(file); preUploaded = true; }
           }
         }
-        steps.push({ step: '1b_eyecatch_delete', del, hit, preUploaded });
+        let afterDel = null;
+        if (!hit) {
+          // 入口が見つからないときは、削除後の画面上部を撮って返す（推測で押さない）
+          await page.evaluate(() => window.scrollTo(0, 0));
+          await page.waitForTimeout(1500);
+          afterDel = await page.evaluate(() => {
+            const out = [];
+            document.querySelectorAll('button, [role="button"], [aria-label], input[type="file"], label').forEach(el => {
+              const r = el.getBoundingClientRect();
+              if (r.top < 500 && r.width > 0 && !el.closest('.ProseMirror')) out.push(el.tagName + ' ' + ((el.getAttribute('aria-label') || '') + '|' + (el.textContent || '').trim()).slice(0, 40) + ' @' + Math.round(r.left) + ',' + Math.round(r.top));
+            });
+            return [...new Set(out)].slice(0, 50);
+          });
+          const shot = await page.screenshot({ type: 'jpeg', quality: 60, clip: { x: 0, y: 0, width: 1280, height: 600 } }).catch(() => null);
+          if (shot) steps.push({ step: '1b_shot', shot: shot.toString('base64') });
+        }
+        steps.push({ step: '1b_eyecatch_delete', del, hit, preUploaded, afterDel });
       }
       if (!hit) { try { unlinkSync(file); } catch {} return abort('見出し画像の変更ボタンが見つかりません', { eyecatch: { before: before && before.src, controls } }); }
       await page.waitForTimeout(1500);
