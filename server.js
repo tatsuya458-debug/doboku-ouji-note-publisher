@@ -963,6 +963,7 @@ app.post('/replace-body', async (req, res) => {
         const r = i.getBoundingClientRect();
         return { src: i.src, x: r.left + r.width / 2, y: r.top + r.height / 2 };
       });
+      await dismissModals(page);
       const before = await eyeImg();
       if (before) { await page.mouse.move(before.x, before.y); await page.waitForTimeout(1200); }
       const controls = await page.evaluate(() => {
@@ -996,13 +997,17 @@ app.post('/replace-body', async (req, res) => {
             const cx = r.left + r.width / 2, cy = r.top + r.height / 2;
             return r.width > 0 && cx >= ir.left && cx <= ir.right && cy >= ir.top && cy <= ir.bottom;
           });
-          if (cands.length !== 1) return { ok: false, reason: '画像上の削除ボタンが' + cands.length + '個' };
+          if (cands.length !== 1) {
+            const all = [...document.querySelectorAll('button, [role="button"]')].filter(el => ((el.getAttribute('aria-label') || el.textContent || '').trim()) === '削除')
+              .map(el => { const r = el.getBoundingClientRect(); return { x: Math.round(r.left), y: Math.round(r.top), w: Math.round(r.width), h: Math.round(r.height), parent: (el.parentElement && el.parentElement.className || '').toString().slice(0, 60) }; });
+            return { ok: false, reason: '画像上の削除ボタンが' + cands.length + '個', img: { x: Math.round(ir.left), y: Math.round(ir.top), w: Math.round(ir.width), h: Math.round(ir.height) }, all };
+          }
           cands[0].click();
           return { ok: true };
         });
         await page.waitForTimeout(2000);
         const dialog = await page.evaluate(() => {
-          const m = document.querySelector('.ReactModal__Content, [role="dialog"]');
+          const m = [...document.querySelectorAll('.ReactModal__Content, [role="dialog"]')].find(x => /削除|記事/.test(x.innerText || ''));
           return m ? (m.innerText || '').slice(0, 120) : null;
         });
         if (dialog) { try { unlinkSync(file); } catch {} return abort('見出し画像の削除で確認画面が出たため止めました', { eyecatch: { del, dialog } }); }
