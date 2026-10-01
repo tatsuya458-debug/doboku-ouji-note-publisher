@@ -991,22 +991,22 @@ app.post('/replace-body', async (req, res) => {
           const img = [...document.querySelectorAll('img')].find(x => { const r = x.getBoundingClientRect(); return r.top < 700 && r.width > 300 && /st-note\.com/.test(x.src) && !x.closest('.ProseMirror'); });
           if (!img) return { ok: true, none: '見出し画像は既に無い' };
           const ir = img.getBoundingClientRect();
-          const cands = [...document.querySelectorAll('button, [role="button"]')].filter(el => {
-            const lab = (el.getAttribute('aria-label') || el.textContent || '').trim();
-            if (lab !== '削除') return false;
+          // 見出し画像の削除は画像右上の「✕」（svg aria-label=削除）。画像の枠の内側にあるものだけを対象にする。
+          // 2026-10-01：画面上部に浮かぶ本文用の操作バーにも「削除」があり、それを押すと本文の選択中ブロックが消えた。
+          const cands = [...document.querySelectorAll('[aria-label="削除"]')].filter(el => {
+            if (el.closest('.ProseMirror')) return false;
             const r = el.getBoundingClientRect();
             const cx = r.left + r.width / 2, cy = r.top + r.height / 2;
-            // 操作バーは画像の上端より上に浮かぶ（2026-10-01実測：画像top=101に対し削除ボタンtop=-50）
-            return r.width > 0 && cx >= ir.left && cx <= ir.right && cy >= ir.top - 200 && cy <= ir.bottom;
+            return r.width > 0 && r.top >= 0 && cx >= ir.left && cx <= ir.right && cy >= ir.top && cy <= ir.bottom;
           });
           if (cands.length !== 1) {
-            const all = [...document.querySelectorAll('button, [role="button"]')].filter(el => ((el.getAttribute('aria-label') || el.textContent || '').trim()) === '削除')
-              .map(el => { const r = el.getBoundingClientRect(); return { x: Math.round(r.left), y: Math.round(r.top), w: Math.round(r.width), h: Math.round(r.height), parent: (el.parentElement && el.parentElement.className || '').toString().slice(0, 60) }; });
-            return { ok: false, reason: '画像上の削除ボタンが' + cands.length + '個', img: { x: Math.round(ir.left), y: Math.round(ir.top), w: Math.round(ir.width), h: Math.round(ir.height) }, all };
+            const all = [...document.querySelectorAll('[aria-label="削除"]')].map(el => { const r = el.getBoundingClientRect(); return el.tagName + '@' + Math.round(r.left) + ',' + Math.round(r.top); });
+            return { ok: false, reason: '画像の枠内の削除(✕)が' + cands.length + '個', img: { x: Math.round(ir.left), y: Math.round(ir.top), w: Math.round(ir.width), h: Math.round(ir.height) }, all };
           }
-          cands[0].click();
-          return { ok: true };
+          const r = cands[0].getBoundingClientRect();
+          return { ok: true, click: { x: r.left + r.width / 2, y: r.top + r.height / 2 }, tag: cands[0].tagName };
         });
+        if (del.ok && del.click) { await page.mouse.click(del.click.x, del.click.y); }
         await page.waitForTimeout(2000);
         const dialog = await page.evaluate(() => {
           const m = [...document.querySelectorAll('.ReactModal__Content, [role="dialog"]')].find(x => /削除|記事/.test(x.innerText || ''));
