@@ -982,6 +982,39 @@ app.post('/replace-body', async (req, res) => {
         const l = page.locator(sel).first();
         if (await l.isVisible({ timeout: 800 }).catch(() => false)) { hit = sel; await l.click({ force: true }); break; }
       }
+      if (!hit && before) {
+        // 既存の見出し画像には「変更」が無く、ホバーで「削除」だけが出る（2026-10-01実測）。
+        // 削除 → 「画像を追加」から入れ直す。押すのは見出し画像の矩形の中にある「削除」だけ（記事の削除と取り違えない）
+        const del = await page.evaluate(() => {
+          const img = [...document.querySelectorAll('img')].find(x => { const r = x.getBoundingClientRect(); return r.top < 700 && r.width > 300 && /st-note\.com/.test(x.src); });
+          if (!img) return { ok: false, reason: 'img無し' };
+          const ir = img.getBoundingClientRect();
+          const cands = [...document.querySelectorAll('button, [role="button"]')].filter(el => {
+            const lab = (el.getAttribute('aria-label') || el.textContent || '').trim();
+            if (lab !== '削除') return false;
+            const r = el.getBoundingClientRect();
+            const cx = r.left + r.width / 2, cy = r.top + r.height / 2;
+            return r.width > 0 && cx >= ir.left && cx <= ir.right && cy >= ir.top && cy <= ir.bottom;
+          });
+          if (cands.length !== 1) return { ok: false, reason: '画像上の削除ボタンが' + cands.length + '個' };
+          cands[0].click();
+          return { ok: true };
+        });
+        await page.waitForTimeout(2000);
+        const dialog = await page.evaluate(() => {
+          const m = document.querySelector('.ReactModal__Content, [role="dialog"]');
+          return m ? (m.innerText || '').slice(0, 120) : null;
+        });
+        if (dialog) { try { unlinkSync(file); } catch {} return abort('見出し画像の削除で確認画面が出たため止めました', { eyecatch: { del, dialog } }); }
+        if (del.ok) {
+          await page.waitForSelector(EYECATCH_ADD_SELECTORS[0], { timeout: 20000 }).catch(() => {});
+          for (const sel of EYECATCH_ADD_SELECTORS) {
+            const l = page.locator(sel).first();
+            if (await l.isVisible({ timeout: 1500 }).catch(() => false)) { hit = '削除→' + sel; await l.click({ force: true }); break; }
+          }
+        }
+        steps.push({ step: '1b_eyecatch_delete', del, hit });
+      }
       if (!hit) { try { unlinkSync(file); } catch {} return abort('見出し画像の変更ボタンが見つかりません', { eyecatch: { before: before && before.src, controls } }); }
       await page.waitForTimeout(1500);
       let uploaded = false, how = '';
