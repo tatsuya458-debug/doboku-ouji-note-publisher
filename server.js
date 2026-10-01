@@ -902,7 +902,8 @@ app.post('/replace-body', async (req, res) => {
   const mustContain = Array.isArray(b.mustContain) ? b.mustContain.map(String) : [];
   const mustNotContain = Array.isArray(b.mustNotContain) ? b.mustNotContain.map(String) : [];
   const dryRun = b.dryRun !== false;
-  if (!cookie || !key || !title || !body || !paidAnchor || !expectPrice) {
+  const keepBody = !!b.keepBody;   // true なら本文とタイトルは触らない（見出し画像だけ替える等・2026-10-01）
+  if (!cookie || !key || (!keepBody && (!title || !body)) || !paidAnchor || !expectPrice) {
     return res.status(400).json({ success: false, error: 'cookie, key, title, body, paidAnchor, expectPrice required' });
   }
   if (!dryRun && !b.confirm) return res.status(400).json({ success: false, error: 'confirm:true required（公開中の記事を書き換えます）' });
@@ -947,6 +948,78 @@ app.post('/replace-body', async (req, res) => {
     steps.push({ step: '1_open', before, cta: await topCta() });
     if (!before.found) return abort('本文エディタが見つかりません');
 
+    // --- 1b. 見出し画像の差し替え（任意・2026-10-01追加） ---
+    // 公開中の記事の見出し画像を、タイトル変更に合わせて作り直すために追加。
+    // 変更前後の画像URLを読み、変わったことを確かめる。ボタンが見つからなければ画面上部の操作一覧を記録して止める。
+    if (b.eyecatch) {
+      const ext = /^data:image\/jpe?g/.test(b.eyecatch) ? 'jpg' : 'png';
+      const file = join(tmpdir(), `eye_${crypto.randomBytes(4).toString('hex')}.${ext}`);
+      writeFileSync(file, Buffer.from(String(b.eyecatch).replace(/^data:image\/\w+;base64,/, ''), 'base64'));
+      await page.evaluate(() => window.scrollTo(0, 0));
+      await page.waitForTimeout(1500);
+      const eyeImg = () => page.evaluate(() => {
+        const i = [...document.querySelectorAll('img')].find(x => { const r = x.getBoundingClientRect(); return r.top < 700 && r.width > 300 && /st-note\.com/.test(x.src); });
+        if (!i) return null;
+        const r = i.getBoundingClientRect();
+        return { src: i.src, x: r.left + r.width / 2, y: r.top + r.height / 2 };
+      });
+      const before = await eyeImg();
+      if (before) { await page.mouse.move(before.x, before.y); await page.waitForTimeout(1200); }
+      const controls = await page.evaluate(() => {
+        const out = [];
+        document.querySelectorAll('button, [role="button"], [aria-label]').forEach(el => {
+          const r = el.getBoundingClientRect();
+          if (r.top < 700 && r.width > 0) {
+            const t = ((el.getAttribute('aria-label') || '') + '|' + (el.textContent || '').trim()).slice(0, 40);
+            if (t.length > 1) out.push(t);
+          }
+        });
+        return [...new Set(out)].slice(0, 40);
+      });
+      const SEL = ['[aria-label="画像を変更"]', 'button:has-text("画像を変更")', 'button:has-text("変更")', ...EYECATCH_ADD_SELECTORS];
+      let hit = null;
+      for (const sel of SEL) {
+        const l = page.locator(sel).first();
+        if (await l.isVisible({ timeout: 800 }).catch(() => false)) { hit = sel; await l.click({ force: true }); break; }
+      }
+      if (!hit) { try { unlinkSync(file); } catch {} return abort('見出し画像の変更ボタンが見つかりません', { eyecatch: { before: before && before.src, controls } }); }
+      await page.waitForTimeout(1500);
+      let uploaded = false, how = '';
+      const upCandidates = ['button:has-text("画像をアップロード")', 'button:has-text("アップロード")', 'button:has-text("ファイルを選択")', 'label:has-text("アップロード")'];
+      for (const sel of upCandidates) {
+        const u = page.locator(sel).first();
+        if (await u.isVisible({ timeout: 1500 }).catch(() => false)) {
+          try {
+            const [fc] = await Promise.all([page.waitForEvent('filechooser', { timeout: 10000 }), u.click()]);
+            await fc.setFiles(file); uploaded = true; how = sel; break;
+          } catch (e) { how = 'filechooser失敗: ' + e.message.slice(0, 40); }
+        }
+      }
+      if (!uploaded) {
+        const fi = page.locator('input[type="file"]').first();
+        if (await fi.count().catch(() => 0)) { await fi.setInputFiles(file); uploaded = true; how = 'input[type=file]'; }
+      }
+      if (uploaded) {
+        await page.waitForTimeout(3000);
+        const okCandidates = ['.ReactModal__Content button:has-text("保存")', 'button:has-text("保存")', 'button:has-text("適用")', 'button:has-text("設定する")', 'button:has-text("完了")'];
+        for (const sel of okCandidates) {
+          const s = page.locator(sel).first();
+          if (await s.isVisible({ timeout: 2500 }).catch(() => false)) { await s.click(); how += ' → ' + sel; await page.waitForTimeout(4000); break; }
+        }
+      }
+      try { unlinkSync(file); } catch {}
+      let after = null;
+      for (let k = 0; k < 15 && uploaded; k++) {
+        await page.evaluate(() => window.scrollTo(0, 0));
+        after = await eyeImg();
+        if (after && (!before || after.src !== before.src)) break;
+        await page.waitForTimeout(2000);
+      }
+      steps.push({ step: '1b_eyecatch', hit, how, uploaded, before: before && before.src.slice(-50), after: after && after.src.slice(-50), controls });
+      if (!after || (before && after.src === before.src)) return abort('見出し画像が変わりませんでした');
+    }
+
+    if (!keepBody) {
     // --- 2. タイトル ---
     const titleSel = 'textarea[placeholder*="タイトル"]';
     const titleOk = await page.locator(titleSel).first().isVisible({ timeout: 5000 }).catch(() => false);
@@ -1158,6 +1231,7 @@ app.post('/replace-body', async (req, res) => {
       steps.push({ step: '4_toc', toc });
       if (toc.after.missing.length) return abort('目次の挿入後に本文が欠けました');
     }
+    }   // if (!keepBody)
     await page.waitForTimeout(4000);   // 自動保存
     if (b.stopAfterEdit) {
       // 動作確認用：公開設定画面には進まずに閉じる
@@ -1191,9 +1265,10 @@ app.post('/replace-body', async (req, res) => {
       if (!el) return { ok: false };
       el.click(); return { ok: true };
     });
-    if (!opened.ok) return abort('「有料エリア設定」ボタンが見つかりません', { cta: await topCta() });
+    const ctaNow = await topCta();
+    if (!opened.ok && !(keepBody && ctaNow.some(t => /^更新する$/.test(t)))) return abort('「有料エリア設定」ボタンが見つかりません', { cta: ctaNow });
     await page.waitForTimeout(9000);
-    const paidArea = await page.evaluate((anchor) => {
+    const paidArea = !opened.ok ? { ok: true, skipped: '本文を変えていないので有料ラインはそのまま' } : await page.evaluate((anchor) => {
       const LABEL = 'ラインをこの場所に変更';
       const btns = [...document.querySelectorAll('button')].filter(x => (x.textContent || '').trim() === LABEL);
       const anchorEl = [...document.querySelectorAll('*')].find(el => el.childElementCount === 0 && (el.textContent || '').indexOf(anchor) >= 0);
